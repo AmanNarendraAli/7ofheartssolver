@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable
+from types import MappingProxyType
+from typing import Iterable, Mapping
 
 
 class Suit(str, Enum):
@@ -115,6 +116,9 @@ class GameState:
         return cards
 
     def public_legal_cards(self) -> set[Card]:
+        if not self.played_cards():
+            return {Card(Suit.HEARTS, 7)}
+
         legal: set[Card] = set()
         for suit, run in self.table.items():
             legal.update(run.legal_cards(suit))
@@ -124,7 +128,30 @@ class GameState:
         hand_set = set(hand)
         return sorted(hand_set & self.public_legal_cards())
 
-    def after_play(self, player: int, card: Card | None) -> "GameState":
+    def validate_turn(self, hand: Iterable[Card], card: Card | None) -> None:
+        legal = set(self.legal_moves(hand))
+        if card is None:
+            if legal:
+                raise ValueError(f"cannot pass with legal moves available: {labels(legal)}")
+            return
+
+        if card not in set(hand):
+            raise ValueError(f"cannot play {card}: card is not in hand")
+        if card not in legal:
+            raise ValueError(f"cannot play {card}: legal moves are {labels(legal)}")
+
+    def after_play(
+        self,
+        player: int,
+        card: Card | None,
+        hand: Iterable[Card] | None = None,
+        validate: bool = False,
+    ) -> "GameState":
+        if validate or hand is not None:
+            if hand is None:
+                raise ValueError("hand is required when validate=True")
+            self.validate_turn(hand, card)
+
         if card is None:
             return GameState(
                 table=self.table,
@@ -160,12 +187,39 @@ class PlayerKnowledge:
 @dataclass(frozen=True)
 class OpponentModel:
     possible_cards: dict[int, set[Card]]
+    hand_counts: tuple[int | None, int | None, int | None, int | None] | None = None
 
-    def probability_any_opponent_has(self, card: Card) -> float:
-        probs = [1.0 if card in cards else 0.0 for cards in self.possible_cards.values()]
-        if not probs:
+    def holder_probability(self, player: int, card: Card) -> float:
+        weights = self._holder_weights(card)
+        total = sum(weights.values())
+        if total == 0.0:
             return 0.0
-        return sum(probs) / len(probs)
+        return weights.get(player, 0.0) / total
+
+    def _holder_weights(self, card: Card) -> dict[int, float]:
+        weights: dict[int, float] = {}
+        for player, possible in self.possible_cards.items():
+            if card not in possible:
+                continue
+            count = self.hand_counts[player] if self.hand_counts is not None else None
+            if count is None:
+                weights[player] = 1.0
+            else:
+                weights[player] = max(count, 0) / max(len(possible), 1)
+        return weights
+
+    def consistency_errors(self) -> tuple[str, ...]:
+        if self.hand_counts is None:
+            return ()
+
+        errors: list[str] = []
+        for player, possible in self.possible_cards.items():
+            count = self.hand_counts[player]
+            if count is not None and count > len(possible):
+                errors.append(
+                    f"player {player} has count {count}, but only {len(possible)} possible cards"
+                )
+        return tuple(errors)
 
 
 def build_opponent_model(state: GameState, knowledge: PlayerKnowledge) -> OpponentModel:
@@ -175,13 +229,9 @@ def build_opponent_model(state: GameState, knowledge: PlayerKnowledge) -> Oppone
 
     simulated = GameState()
     for event in state.history:
-        if event.player == knowledge.player:
-            if event.card is not None:
-                simulated = simulated.after_play(event.player, event.card)
-            continue
-
         if event.is_pass:
-            possible[event.player] -= simulated.public_legal_cards()
+            if event.player in possible:
+                possible[event.player] -= simulated.public_legal_cards()
             simulated = simulated.after_play(event.player, None)
         else:
             assert event.card is not None
@@ -190,23 +240,30 @@ def build_opponent_model(state: GameState, knowledge: PlayerKnowledge) -> Oppone
                     possible[player].discard(event.card)
             simulated = simulated.after_play(event.player, event.card)
 
-    return OpponentModel(possible_cards=possible)
+    return OpponentModel(possible_cards=possible, hand_counts=state.hand_counts)
 
 
 @dataclass(frozen=True)
 class MoveScore:
     card: Card
     score: float
+    components: Mapping[str, float]
     reasons: tuple[str, ...]
 
 
-def score_move(state: GameState, knowledge: PlayerKnowledge, card: Card) -> MoveScore:
+def score_move(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    card: Card,
+    model: OpponentModel | None = None,
+) -> MoveScore:
     hand_after = set(knowledge.hand) - {card}
     next_state = state.after_play(knowledge.player, card)
-    model = build_opponent_model(state, knowledge)
+    model = model or build_opponent_model(state, knowledge)
 
-    score = 10.0
-    reasons = ["played one card: +10.0"]
+    score = 0.0
+    components: dict[str, float] = {}
+    reasons: list[str] = []
 
     before_legal = set(state.legal_moves(knowledge.hand))
     after_legal = set(next_state.legal_moves(hand_after))
@@ -214,52 +271,124 @@ def score_move(state: GameState, knowledge: PlayerKnowledge, card: Card) -> Move
     self_unlock = 3.0 * len(newly_self_playable)
     if self_unlock:
         score += self_unlock
+        components["self_unlock"] = self_unlock
         reasons.append(f"unlocks own cards {labels(newly_self_playable)}: +{self_unlock:.1f}")
 
     opened_for_table = next_state.public_legal_cards() - state.public_legal_cards()
     opened_for_others = opened_for_table - hand_after
-    opponent_risk = sum(model.probability_any_opponent_has(c) for c in opened_for_others) * 2.0
+    opponent_risk = opponent_unlock_risk(state, knowledge, model, opened_for_others)
     if opponent_risk:
         score -= opponent_risk
+        components["opponent_unlock_risk"] = -opponent_risk
         reasons.append(f"may unlock opponents {labels(opened_for_others)}: -{opponent_risk:.1f}")
 
-    control_value = retained_control_value(state, knowledge, card)
-    if control_value:
-        score -= control_value
-        reasons.append(f"gives up blocking value: -{control_value:.1f}")
+    chain_impact = future_chain_impact(state, knowledge, card, model)
+    if chain_impact:
+        score += chain_impact
+        components["future_chain_impact"] = chain_impact
+        sign = "+" if chain_impact > 0 else ""
+        reasons.append(f"future chain impact: {sign}{chain_impact:.1f}")
 
-    urgency = endgame_urgency(state, knowledge.player)
-    if urgency:
-        score += urgency
-        reasons.append(f"endgame urgency: +{urgency:.1f}")
-
-    return MoveScore(card=card, score=score, reasons=tuple(reasons))
-
-
-def retained_control_value(state: GameState, knowledge: PlayerKnowledge, card: Card) -> float:
-    run = state.table[card.suit]
-    if not run.is_open and card.rank == 7:
-        same_suit = {c for c in knowledge.hand if c.suit == card.suit and c != card}
-        if not same_suit:
-            return 5.0
-        distance_pressure = sum(abs(c.rank - 7) for c in same_suit)
-        return max(0.0, 4.0 - distance_pressure * 0.35)
-
-    if run.is_open:
-        assert run.low is not None and run.high is not None
-        if card.rank in {run.low - 1, run.high + 1}:
-            outward_cards = cards_blocked_behind(card, knowledge.hand)
-            if not outward_cards:
-                return 2.0
-    return 0.0
+    return MoveScore(
+        card=card,
+        score=score,
+        components=MappingProxyType(dict(components)),
+        reasons=tuple(reasons),
+    )
 
 
-def cards_blocked_behind(card: Card, hand: Iterable[Card]) -> set[Card]:
+def opponent_unlock_risk(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    model: OpponentModel,
+    opened_cards: set[Card],
+) -> float:
+    risk = 0.0
+    for opponent in model.possible_cards:
+        playable_mass = sum(model.holder_probability(opponent, card) for card in opened_cards)
+        capped_mass = min(1.0, playable_mass)
+        risk += capped_mass * turn_order_weight(knowledge.player, opponent)
+    return risk * 2.0
+
+
+def turn_order_weight(player: int, opponent: int) -> float:
+    turns_until = (opponent - player) % 4
+    if turns_until == 0:
+        return 0.0
+    return 1.0 / turns_until
+
+
+def future_chain_impact(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    card: Card,
+    model: OpponentModel | None = None,
+) -> float:
+    """Estimate the long-term suit control gained or released by playing a card."""
+    hand_after = set(knowledge.hand) - {card}
+    unseen = knowledge.unseen_cards(state)
+    model = model or build_opponent_model(state, knowledge)
+
+    impact = 0.0
+    for side in released_sides(card):
+        future_cards = {Card(card.suit, rank) for rank in side}
+        own_future = future_cards & hand_after
+        unseen_future = future_cards & unseen
+
+        # Releasing a long chain mostly benefits the table unless we own part of that runway.
+        impact -= 0.35 * len(unseen_future)
+        impact += 0.75 * len(own_future)
+
+        tail_card = owned_tail_card(card.suit, side, own_future)
+        if tail_card is not None:
+            impact += max(0.0, 2.0 - time_to_playable(state, tail_card) * 0.25)
+
+        if side and owns_gate_card(card.suit, side, hand_after):
+            impact += 1.0
+
+        opponent_runway_mass = sum(
+            model.holder_probability(opponent, future_card) * turn_order_weight(knowledge.player, opponent)
+            for future_card in future_cards
+            for opponent in model.possible_cards
+        )
+        impact -= 0.08 * opponent_runway_mass
+
+    return impact
+
+
+def released_sides(card: Card) -> list[range]:
+    if card.rank == 7:
+        return [range(1, 7), range(8, 14)]
     if card.rank < 7:
-        return {c for c in hand if c.suit == card.suit and c.rank < card.rank}
-    if card.rank > 7:
-        return {c for c in hand if c.suit == card.suit and c.rank > card.rank}
-    return set()
+        return [range(1, card.rank)]
+    return [range(card.rank + 1, 14)]
+
+
+def owned_tail_card(suit: Suit, side: range, cards: set[Card]) -> Card | None:
+    if not side:
+        return None
+    tail_rank = 1 if max(side) < 7 else 13
+    tail_card = Card(suit, tail_rank)
+    return tail_card if tail_card in cards else None
+
+
+def owns_gate_card(suit: Suit, side: range, cards: set[Card]) -> bool:
+    if not side:
+        return False
+    gate_rank = max(side) if max(side) < 7 else min(side)
+    return Card(suit, gate_rank) in cards
+
+
+def time_to_playable(state: GameState, card: Card) -> int:
+    run = state.table[card.suit]
+    if not run.is_open:
+        return abs(card.rank - 7)
+    assert run.low is not None and run.high is not None
+    if run.low <= card.rank <= run.high:
+        return 0
+    if card.rank < run.low:
+        return run.low - card.rank
+    return card.rank - run.high
 
 
 def endgame_urgency(state: GameState, player: int) -> float:
@@ -271,21 +400,23 @@ def endgame_urgency(state: GameState, player: int) -> float:
         count for p, count in enumerate(state.hand_counts) if p != player and count is not None
     ]
     if not known_opponent_counts:
-        return 4.0 if my_count <= 3 else 0.0
+        return max(0.0, 5.0 - my_count)
 
     lowest_opponent = min(known_opponent_counts)
-    if my_count <= 3:
-        return 4.0
-    if lowest_opponent <= 3:
-        return 2.0
-    return 0.0
+    my_urgency = max(0.0, 5.0 - my_count)
+    opponent_urgency = max(0.0, 4.0 - lowest_opponent) * 0.75
+    race_pressure = 0.0
+    if min(my_count, lowest_opponent) <= 5:
+        race_pressure = max(0.0, my_count - lowest_opponent) * 0.25
+    return my_urgency + opponent_urgency + race_pressure
 
 
 def recommend_move(state: GameState, knowledge: PlayerKnowledge) -> MoveScore | None:
     legal = state.legal_moves(knowledge.hand)
     if not legal:
         return None
-    return max((score_move(state, knowledge, card) for card in legal), key=lambda s: s.score)
+    model = build_opponent_model(state, knowledge)
+    return max((score_move(state, knowledge, card, model) for card in legal), key=lambda s: s.score)
 
 
 def labels(cards: Iterable[Card]) -> str:
