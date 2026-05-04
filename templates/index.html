@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>7 of Hearts</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div id="setup-overlay" class="overlay">
+    <div class="setup-card">
+      <h1>7 of Hearts</h1>
+      <p class="subtitle">Pick which seats are bots. Empty seats are yours to play.</p>
+      <div class="seat-grid">
+        <label class="seat-toggle"><input type="checkbox" data-seat="0" /> Seat 0 (bottom) is a bot</label>
+        <label class="seat-toggle"><input type="checkbox" data-seat="1" checked /> Seat 1 (left) is a bot</label>
+        <label class="seat-toggle"><input type="checkbox" data-seat="2" checked /> Seat 2 (top) is a bot</label>
+        <label class="seat-toggle"><input type="checkbox" data-seat="3" checked /> Seat 3 (right) is a bot</label>
+      </div>
+      <div class="seed-row">
+        <label for="seed-input">Seed (optional)</label>
+        <input id="seed-input" type="number" placeholder="random" />
+      </div>
+      <button id="start-btn" class="primary">Deal</button>
+    </div>
+  </div>
+
+  <main id="game-area" class="hidden">
+    <div class="table-wrap">
+      <div class="seat seat-0" id="seat-0"></div>
+      <div class="seat seat-1" id="seat-1"></div>
+      <div class="seat seat-2" id="seat-2"></div>
+      <div class="seat seat-3" id="seat-3"></div>
+
+      <div class="board">
+        <div class="suit-row" data-suit="H"><span class="suit-label">&hearts;</span><div class="rank-row"></div></div>
+        <div class="suit-row" data-suit="S"><span class="suit-label">&spades;</span><div class="rank-row"></div></div>
+        <div class="suit-row" data-suit="D"><span class="suit-label">&diams;</span><div class="rank-row"></div></div>
+        <div class="suit-row" data-suit="C"><span class="suit-label">&clubs;</span><div class="rank-row"></div></div>
+      </div>
+
+      <div class="winner-banner hidden" id="winner-banner"></div>
+    </div>
+
+    <section class="hand-area">
+      <div class="hand-header">
+        <div id="active-label">Waiting…</div>
+        <div class="hand-actions">
+          <button id="pass-btn" disabled>Pass</button>
+          <button id="new-game-btn" class="secondary">New game</button>
+        </div>
+      </div>
+      <div class="hand" id="hand"></div>
+      <div id="recommendation" class="recommendation hidden"></div>
+      <div id="toast" class="toast hidden"></div>
+    </section>
+
+    <aside class="log-area" id="log-area">
+      <button id="log-toggle" class="log-toggle" type="button" aria-expanded="true" aria-controls="log">
+        <span>Move log</span>
+        <span class="log-toggle-icon" aria-hidden="true">▾</span>
+      </button>
+      <ol id="log"></ol>
+    </aside>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

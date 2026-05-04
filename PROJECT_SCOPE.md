@@ -133,8 +133,19 @@ It currently includes:
 - A `PlayerKnowledge` model containing the solver's player index and private hand.
 - Calculation of unseen cards as `full_deck - own_hand - cards_on_table`.
 - Basic opponent inference from passes.
+- Exact hand-count-consistent holder marginals when known counts are available and consistent.
+- Constrained hidden-deal sampling for simulation-ready opponent hand assignments.
+- Oracle greedy rollouts and Monte Carlo move evaluation over sampled hidden deals.
+- Exact full-information rational-play solving for small/late-game complete-hand states.
+- Exact full-information fixed-policy solving for comparing against declared opponent policies.
+- Exhaustive hidden-deal enumeration and exact imperfect-information expected value when the belief set is small enough.
+- Complete random-deal simulation and aggregate self-play metrics.
+- First-class strategy weight parameters for heuristic and oracle scoring.
+- Shared-deal strategy tuning probes that compare candidate weight sets against baseline opponents.
 - Heuristic move scoring and recommendation through `recommend_move`.
 - Immutable structured score components alongside human-readable score reasons.
+- Structured proof-layer result objects that expose value vectors, move values, best moves, chosen moves, cache statistics, and exhaustive/non-exhaustive status.
+- Human-readable proof certificates for full-information and imperfect-information exact recommendations.
 
 Player hand counts are optional. The solver can run with:
 
@@ -204,7 +215,19 @@ It then walks through public move history:
 - If an opponent passed, cards that were legal at that moment are removed from that opponent's possible cards.
 - If an opponent played a card, that card is removed from the other opponents' possible cards.
 
-The model now exposes per-holder marginal estimates through `holder_probability(player, card)` rather than using the earlier misnamed "probability any opponent has this card" idea. Since every unseen card must be held by some opponent, the useful question is which opponent is likely to hold it.
+The model exposes per-holder marginal estimates through `holder_probability(player, card)` rather than using the earlier misnamed "probability any opponent has this card" idea. Since every unseen card must be held by some opponent, the useful question is which opponent is likely to hold it.
+
+When one or more opponent hand counts are known, the model now attempts exact count-consistent inference with a dynamic program:
+
+- Every hidden card is assigned to exactly one possible opponent holder.
+- Known hand counts are treated as quotas that must be exactly satisfied.
+- Unknown opponent counts are left unconstrained and absorb any remaining cards.
+- Public pass and play constraints remain hard constraints.
+- The DP counts all hidden assignments consistent with those constraints and converts those counts into per-card, per-player holder marginals.
+
+The architectural decision here is to improve the hidden-card model before adding multi-turn search. This keeps the active solver deterministic, inspectable, and aligned with the current next-move scope, while making every existing heuristic component consume better probabilities. It also avoids prematurely adding Monte Carlo variance or rollout policy questions before the one-move evaluator has a sounder information model.
+
+If exact count-consistent inference cannot be used, such as when no useful counts are known or the known counts are inconsistent with the public constraints, the model falls back to the older weighted possible-holder estimate.
 
 Unlock risk is turn-order-aware:
 
@@ -212,9 +235,213 @@ Unlock risk is turn-order-aware:
 - Cards likely held by later opponents are discounted.
 - Multiple newly legal cards are capped per opponent turn so opening `6S` and `8S` is not treated as if both can be played by the same opponent immediately.
 
-Known hand counts are used as a rough weighting signal when available, but the model still does not fully enforce exact hidden-hand distributions.
+Known hand counts are now exact constraints when the DP can satisfy them. The previous rough count weighting remains only as a fallback when exact inference is unavailable.
 
 For every unseen card that has at least one possible holder, holder probabilities are normalized so the per-opponent marginals sum to 1. The model also exposes `consistency_errors()` to flag impossible states, such as a known opponent hand count being larger than that opponent's remaining possible card set.
+
+## Hidden Deal Sampling
+
+The solver now includes constrained hidden-deal sampling through `sample_hidden_deal(...)` and `sample_hidden_deals(...)`.
+
+A sampled hidden deal is a complete assignment of every unseen card to exactly one opponent. The sampler uses the same public information model as holder inference:
+
+- The solver's own hand and already played table cards are excluded.
+- Passed legal cards are excluded from the passing opponent's possible hand.
+- Cards publicly played by one opponent are excluded from every other opponent.
+- Known opponent hand counts are enforced exactly when provided.
+- Unknown opponent hand counts remain unconstrained and absorb whatever hidden cards are not assigned to known-count opponents.
+
+The algorithmic decision is to sample from the constrained assignment space directly instead of sampling independent cards from marginal probabilities. Independent marginal sampling would be simpler, but it could create impossible deals where a known-count opponent receives too many cards, too few cards, or a combination of cards that violates pass information. The current sampler walks hidden cards in sorted order and, when known counts exist, uses a dynamic program to count valid completions from each partial assignment. Random choices are weighted by the number of valid completions, so sampled deals remain count-consistent all the way through.
+
+This is intentionally not yet a Monte Carlo player. The sampler creates plausible hidden worlds; a later rollout/search layer will decide how to use those worlds to evaluate candidate moves over multiple turns.
+
+## Oracle Rollouts and Monte Carlo Evaluation
+
+The solver now includes an oracle rollout layer through `rollout_oracle(...)`, `evaluate_move_monte_carlo(...)`, and `recommend_move_monte_carlo(...)`.
+
+The Monte Carlo evaluator works as follows:
+
+- Generate a constrained hidden deal from the current public state.
+- Apply a candidate legal move for the solver.
+- Continue the game forward using complete sampled hands.
+- On each simulated turn, the acting player chooses a legal move with an oracle greedy policy.
+- Score the candidate by simulated first-out win rate, with average finish margin as a secondary signal and timeouts as a penalty.
+
+The important architectural distinction is that the real solver still does not know opponents' hands. Full hand knowledge is used only inside sampled worlds during rollout. The top-level move estimate is still an expectation over plausible hidden deals, not a full-information assumption about the real game.
+
+The rollout policy is called "oracle" because each simulated player can see the complete sampled deal. It is still greedy rather than game-theoretically exhaustive: each simulated turn uses a full-information version of the current structural heuristic, including exact opponent unlock risk, exact future chain impact, and race pressure from actual hand counts.
+
+The oracle move chooser now includes a one-ply response adjustment. For each candidate move, it estimates the strongest immediate move available to the next player and discounts the candidate by part of that response value. This was added because pure greedy oracle play can be too myopic: a move may look locally productive while handing the next player an even stronger response. The one-ply penalty is deliberately shallow and inspectable, avoiding recursive search while improving tactical caution.
+
+Monte Carlo scores now include:
+
+- completed sample count
+- first-out win rate
+- win-rate standard error
+- average finish margin
+- average rollout length in turns
+- timeout rate
+
+The standard error is included so close results can be treated with appropriate skepticism. For example, two moves separated by less than one or two standard errors should be considered statistically close rather than decisively ranked.
+
+This layer creates a useful comparison:
+
+- `recommend_move(...)` gives the current one-move explainable heuristic recommendation.
+- `recommend_move_monte_carlo(...)` gives a rollout-backed recommendation over plausible hidden worlds.
+
+When those recommendations disagree, the position is strategically interesting. The disagreement can show that a move with good immediate structure has poor long-run sampled outcomes, or that a locally scary unlock is acceptable because the sampled continuation favors the solver.
+
+## Exact Proof Layer
+
+The project now includes an initial proof-grade solver layer for positions where exhaustive evaluation is tractable.
+
+The full-information exact solver uses `FullInformationState` and `solve_full_information(...)`.
+
+It assumes:
+
+- all four hands are known
+- the table state is known
+- the current player is known
+- each player rationally maximizes their own first-out value
+- ties are resolved by a deterministic documented tie-breaker
+
+The solver recursively evaluates every legal continuation with memoization. It does not use heuristic pruning or rollout cutoffs. The returned `ExactSolverResult` includes:
+
+- the root value vector
+- every legal move's child value vector
+- all moves tied under the acting player's primary objective
+- the deterministic chosen move
+- states evaluated
+- cache hits
+- terminal states reached
+- deadlock states reached
+
+The exact layer also includes `solve_full_information_against_policy(...)`, which evaluates the root decision against a declared fixed future policy. This is useful for proving best response to simple bots or regression policies before tackling full rational play.
+
+Exact solver results can be rendered with `format_exact_solver_certificate(...)`, which prints the assumptions, legal moves, value vectors, selected move, tie-break rule, and search statistics.
+
+The imperfect-information exact layer uses `enumerate_hidden_deals(...)`, `evaluate_move_exact_imperfect_information(...)`, and `recommend_move_exact_imperfect_information(...)`.
+
+It computes exact expected value only when all hidden deals consistent with the public evidence are enumerated. Candidate moves now share one hidden-deal enumeration and one exact continuation cache, so exact recommendation avoids recomputing the same belief set and common continuations for every legal card. If `max_deals` truncates enumeration, the result is explicitly marked non-exhaustive and should be treated as diagnostic rather than proof. Because truncation is a deterministic prefix of the enumeration, it does not report a statistical standard error.
+
+Exact imperfect-information results can be rendered with `format_exact_imperfect_information_certificate(...)`.
+
+`proof_demo.py` prints small proof certificates for:
+
+- rational full-information play
+- fixed-policy full-information play
+- exact hidden-deal expected value
+
+This layer is currently intended for small, late-game, or hand-authored proof scenarios. Full-game initial positions still require Monte Carlo or additional exact-search optimization.
+
+## Benchmark Scenarios
+
+`demo.py` now contains configurable Monte Carlo knobs:
+
+```python
+SAMPLES_PER_MOVE = 80
+MAX_TURNS = 200
+SEED = 7
+```
+
+It also runs named benchmark scenarios:
+
+- **Demo Baseline.** The heuristic and oracle Monte Carlo both prefer `7S`, suggesting that the local self-unlock from `8S` survives rollout testing.
+- **Bare Seven Versus Heart Progress.** The heuristic prefers heart progress, while oracle Monte Carlo prefers `7S` in the current seed. This is a useful disagreement: the local heuristic sees the bare 7 as a broad unlock risk, while rollouts sometimes value opening the suit path anyway.
+- **Controlled Seven With Gates.** The heuristic strongly prefers `7S` because the solver owns both gates, but oracle Monte Carlo prefers `9H` in the current seed. This indicates the rollout layer may be detecting that immediate gate ownership is not always enough if the sampled continuation creates better tempo elsewhere.
+- **Tail Runway Pressure.** Both heuristic and oracle Monte Carlo prefer `6H` in the current seed, with `7S` no longer winning after the one-ply response adjustment and the lower sample-count run.
+
+These are not final proofs of strategic truth. They are regression-style positions that make solver disagreements visible and help guide future tuning.
+
+## Complete Game Simulation
+
+The solver now supports complete random-deal oracle self-play through:
+
+- `deal_random_hands(...)`
+- `initial_state_for_hands(...)`
+- `simulate_complete_game(...)`
+- `estimate_complete_game_metrics(...)`
+
+A complete simulation deals all 52 cards evenly, finds the player holding `7H`, starts from an empty table with that player to act, and rolls forward with the same oracle one-ply policy used by Monte Carlo move evaluation. The simulation stops when the first player empties their hand, which matches the project's strategic objective of maximizing first-out probability.
+
+Random deals are generated from a sorted deck before shuffling, so seeded simulation and tuning runs are reproducible across Python processes.
+
+Aggregate complete-game metrics include:
+
+- games simulated
+- per-seat win rates
+- per-seat win-rate standard errors
+- per-seat average finish margins
+- average turns until first player out
+- timeout rate
+
+The current demo run uses:
+
+```python
+COMPLETE_GAME_SAMPLES = 400
+SELF_PLAY_TUNING_GAMES = 400
+COMPLETE_GAME_MAX_TURNS = 300
+```
+
+With `SEED = 7`, the observed complete random-deal oracle self-play estimate was:
+
+```text
+games 400, turns 56.3, timeouts 0.0%
+P0: win 27.3% +/- 2.2%, margin -1.4
+P1: win 24.2% +/- 2.1%, margin -1.6
+P2: win 24.8% +/- 2.2%, margin -1.4
+P3: win 23.8% +/- 2.1%, margin -1.4
+```
+
+This is a sanity check rather than a strategic conclusion. The useful takeaway is that the oracle policy does not show an obvious seat bias in this run and complete games finish without timeouts.
+
+The current demo also runs a small shared-deal tuning probe:
+
+```text
+candidate controls P0 against baseline opponents over 400 deals
+tuned baseline: win 27.3% +/- 2.2%, margin -1.4, turns 56.3, timeouts 0.0%, score 25.9
+gate tempo: win 27.3% +/- 2.2%, margin -1.4, turns 56.3, timeouts 0.0%, score 25.8
+cautious unlocks: win 27.0% +/- 2.2%, margin -1.4, turns 56.2, timeouts 0.0%, score 25.6
+legacy baseline: win 25.5% +/- 2.2%, margin -1.4, turns 56.4, timeouts 0.0%, score 24.1
+```
+
+This is a tuning probe, not a final tuned result. A later 10,000-deal tuning run found a small additional edge for stronger tail-runway credit:
+
+```text
+tail stronger: win 25.38% +/- 0.44%, margin -1.395, turns 56.0, timeouts 0.00%, score 23.985
+previous tuned: win 25.20% +/- 0.43%, margin -1.403, turns 56.1, timeouts 0.00%, score 23.797
+tail modest: win 24.95% +/- 0.43%, margin -1.413, turns 56.1, timeouts 0.00%, score 23.537
+gate tempo: win 24.74% +/- 0.43%, margin -1.424, turns 56.0, timeouts 0.00%, score 23.316
+cautious unlocks: win 24.56% +/- 0.43%, margin -1.425, turns 56.1, timeouts 0.00%, score 23.135
+legacy baseline: win 24.55% +/- 0.43%, margin -1.426, turns 56.1, timeouts 0.00%, score 23.124
+```
+
+The current default now uses `tail_base_credit=2.6` and `tail_distance_penalty=0.16`.
+
+## Parameter Tuning Status
+
+The scoring weights are now represented explicitly by `StrategyWeights`.
+
+This keeps the default solver behavior inspectable while making candidate strategies easy to compare. The same weight object is consumed by:
+
+- the public heuristic scorer
+- oracle rollout move choice
+- Monte Carlo move evaluation
+- complete-game simulation
+- the shared-deal tuning harness
+
+The project now includes `estimate_strategy_self_play(...)`, which runs multiple candidate `StrategyCandidate` objects over the same random deals. Each candidate controls one configured seat, currently player 0 by default, against baseline-weight oracle opponents. This avoids comparing policies only in all-seats mirror play, where the result is mostly seat and deal variance rather than evidence that a candidate is better.
+
+Simulations currently serve four purposes:
+
+- evaluating move recommendations over sampled hidden deals
+- exposing disagreements between local heuristic scoring and rollout outcomes
+- providing complete-game sanity checks such as win rate balance, average game length, and timeout rate
+- comparing candidate weight sets across shared deals
+
+They do not yet automatically optimize constants such as self-unlock value, opponent unlock risk, future chain impact, tail runway credit, or the one-ply response penalty. The current tuning harness is a measurement layer, not an optimizer.
+
+The next tuning step should be a search layer over candidate weight sets, using the shared-deal harness as the objective evaluator. Until that exists, tuning results should be treated as diagnostics and evidence, not as proof that the weights are optimal.
 
 ## Time-To-Playable Logic
 
@@ -257,10 +484,10 @@ Validation rejects:
 
 The following items are intentionally documented as future work:
 
-- **Hand-count-consistent hidden deal sampling.** Current holder probabilities are approximate. A stronger model should sample or enumerate hidden deals where each unseen card is assigned to exactly one opponent and known hand counts are satisfied.
-- **Monte Carlo and multi-turn search.** The current solver is still a one-move heuristic. Search over sampled hidden deals would better estimate who benefits from a move over several turns.
-- **Self-play and weight tuning.** Constants are still heuristic. A self-play harness should compare strategies across many deals and provide an objective for tuning weights.
+- **Stronger multi-turn search.** The current rollout policy is greedy with oracle hand knowledge plus a one-ply response adjustment. A deeper search layer could compare candidate continuations recursively rather than choosing only the locally best oracle move at each simulated turn.
+- **Automated weight search.** Constants are still heuristic. The shared-deal tuning harness now provides an objective surface, but it does not yet generate or optimize candidate weight sets automatically.
 - **Endgame policy testing.** Endgame urgency is currently diagnostic only. If self-play shows that late-game move preferences should change, urgency should modulate card-specific components rather than being added as a flat score.
+- **Sampler performance optimization.** Exact count-consistent sampling is principled but can be slow at larger sample counts, especially when many moves and benchmark scenarios are evaluated. Caching sampled deals or reusing samples across candidate moves would reduce demo and search cost.
 
 ## Demo and Tests
 
@@ -270,6 +497,10 @@ The following items are intentionally documented as future work:
 - Score for each legal move.
 - Reasons behind each score.
 - The recommended move.
+- Oracle Monte Carlo scores and recommendation.
+- Named benchmark scenarios for strategic comparison.
+- Complete random-deal oracle self-play metrics.
+- Shared-deal candidate strategy tuning metrics.
 
 `test_seven_hearts.py` contains focused tests for rules and inference behavior.
 
@@ -279,7 +510,7 @@ Current verification:
 
 ```text
 py run_tests.py
-23 tests passed
+56 tests passed
 ```
 
 Current demo command:
