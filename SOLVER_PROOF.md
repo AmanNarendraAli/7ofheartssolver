@@ -1,19 +1,45 @@
 # Solver Proof Plan
 
-This document describes how the project can establish, test, and explain that a
-solver for 7 of Hearts is exact or optimal under clearly stated assumptions.
+This document describes how the project can build, test, and explain a real-game
+7 of Hearts solver: a solver that recommends a move from one player's imperfect-
+information view of the table.
 
-The central idea is to separate three claims:
+Primary product target:
+
+```text
+Given the solver's private hand, the public table, turn state, hand counts, and
+public play/pass history, choose the move with the highest first-out expected
+value over the public belief state, while simulated future players act only from
+their own private hand and public evidence.
+```
+
+The central architecture is:
+
+```text
+rules engine
+  -> public-history belief tracking
+    -> constrained hidden-deal sampling/enumeration
+      -> information-limited rollout/search policies
+        -> practical imperfect-information move recommendation
+```
+
+The exact full-information solver is a validation oracle, not the final product.
+It gives proof-sized answer keys, rule/regression tests, and performance
+measurements for reduced or late-game states. Exact hidden-deal EV with full-
+information continuations is also an oracle: useful for judging engines on small
+belief sets, but not the real-game solution because it lets players see hidden
+cards in each materialized deal.
+
+The current project already has useful heuristic, inference, sampling, rollout,
+and exact-oracle layers. The proof plan must keep their claims separate:
 
 1. The rules engine represents the real game correctly.
-2. A full-information solver exactly solves the finite game tree.
-3. A future true imperfect-information solver chooses the best expected move
-   while every player acts only from their own private hand and public evidence.
-
-The current project already has useful heuristic, inference, sampling, and
-rollout layers. Those are evidence-producing systems. A proof-grade solver needs
-an explicit recurrence, a formal objective, and tests/certificates showing that
-every legal continuation is evaluated without approximation.
+2. The belief model conditions hidden deals on public evidence, especially
+   played cards and forced passes.
+3. The practical solver maximizes sampled belief-state EV under documented
+   information-limited continuation policies.
+4. Exact full-information and exact hidden-deal oracle modes provide validation
+   certificates on tractable reduced cases.
 
 ## Implementation Status
 
@@ -76,7 +102,13 @@ Implemented:
   reduced belief position with four candidate moves and 90 hidden deals
 - `proof_demo.py` includes the multi-suit exact EV certificate
 - `proof_benchmark.py` now has an opt-in hard tier with thousand-state reduced
-  exact-search positions
+  exact-search positions; after the bitmask/cache-key pass, the current
+  throughput suggests a 100k-state tier is a realistic next measurement target
+  before treating millions of states as the longer-range scale question
+- 52-bit card masks for compact card-set operations, table/legal-card masks,
+  cached full-information hand masks, and compact exact-solver cache keys
+- reusable hidden-deal sampler state for repeated Monte Carlo sampling
+- shared hidden-deal samples across legal moves in Monte Carlo recommendation
 - hidden-deal enumeration regression tests for pass constraints, known hand
   counts, and impossible constraint/count combinations
 - regression coverage that non-exhaustive exact recommendation reuses the same
@@ -110,8 +142,11 @@ py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py
 
 Important current limitations:
 
-- exact full-information search is suitable for small or late-game states first;
-  full 52-card initial deals may be too large without further optimization
+- exact full-information search is suitable for reduced, late-game, and
+  hand-authored states first. Current hard benchmarks are only at the 4k-state
+  scale, but measured throughput suggests the next benchmark tier should push
+  toward 100k states and possibly beyond with explicit runtime limits. Full
+  52-card initial deals may still be too large without further optimization.
 - deadlocks are counted and given neutral value; valid normal games should not
   hit them before first-out
 - exact imperfect-information evaluation is proof-grade only when
@@ -131,23 +166,28 @@ Important current limitations:
   use bounded tooling with explicit limits, progress reporting, and abort
   controls.
 
-Highest-priority proof work after the current proof pass:
+Highest-priority solver/proof work after the current proof pass:
 
-1. Build the next information-limited evaluation mode: exact EV against declared
-   policies that use only each player's private hand and public evidence.
-2. Treat CFR/perfect-recall extensive-form solving as the preferred long-term
-   path for the true hidden-information solver. Use reduced-deck public-belief
-   search and information-limited policy EV as stepping stones and validation
-   tools, not as the final solution concept.
-3. Extend harder benchmark discovery toward tens of thousands and eventually
-   millions of states, with explicit runtime limits and progress reporting, so
-   the current representation's scale wall is measured more completely.
-4. Consider bitmask state representation for deeper exact search.
-5. Add deeper hidden-deal enumeration regression tests around multi-pass
+1. Build the practical imperfect-information solver path: evaluate candidate
+   moves over shared hidden-deal samples where every simulated player uses only
+   their own private hand and public evidence.
+2. Build exact EV against declared information-limited policies for reduced
+   belief states, so the sampled real-game solver has proof-sized validation
+   targets.
+3. Treat CFR/perfect-recall and public-belief equilibrium methods as later
+   reduced-deck research, not as the required next step for a usable real-game
+   solver.
+4. Extend harder benchmark discovery beyond the current 4k-state hard case:
+   first target 100k-state reduced positions, then test whether larger
+   500k/million-state cases are practical with explicit runtime limits and
+   progress reporting.
+5. Continue extending bitmask representation into deeper simulation/search
+   paths, especially rollout hand updates and information-limited policy caches.
+6. Add deeper hidden-deal enumeration regression tests around multi-pass
    histories.
-6. Add more hand-authored imperfect-information snapshots with 3-5 cards per
+7. Add more hand-authored imperfect-information snapshots with 3-5 cards per
    opponent and multiple public pass constraints.
-7. Grow `proof_eval.py` into a broader engine scoreboard with more exact
+8. Grow `proof_eval.py` into a broader engine scoreboard with more exact
    positions, repeated Monte Carlo seeds, and trend snapshots.
 
 ## Formal Model
@@ -562,10 +602,13 @@ deal.
 
 Near-term bridge targets:
 
-- exact EV against declared information-limited policies
+- sampled move EV over shared hidden deals, where every simulated player acts
+  from their own information-limited view
+- exact EV against declared information-limited policies on reduced belief
+  states
 - reduced-deck public-belief search where belief updates are part of the state
-- CFR or another perfect-recall extensive-form method, with CFR currently the
-  preferred final path for larger true hidden-information play
+- CFR or another perfect-recall extensive-form method as later research if an
+  equilibrium-style solution concept is needed
 
 ### Sampling Approximation
 
@@ -752,7 +795,7 @@ Monte Carlo evaluation is an approximation of this target. It should report
 standard error and confidence intervals, but it should not be described as proof
 of optimality unless the sample space is exhausted.
 
-## Exact Full-Information Recurrence
+## Validation Oracle: Exact Full-Information Recurrence
 
 The exact solver should mirror the recurrence directly.
 
@@ -916,7 +959,7 @@ After a pass:
 - consecutive pass count increments
 - no winner is created by the pass
 
-## Exact Solver Deliverables
+## Validation Oracle Deliverables
 
 ### `FullInformationGameState`
 
@@ -1055,10 +1098,12 @@ Each snapshot should include:
 
 These protect the proof layer from accidental behavioral drift.
 
-## Imperfect-Information Proof Plan
+## Imperfect-Information Solver Plan
 
-After the full-information exact solver exists, use it as the value oracle for
-hidden-deal analysis.
+This is the main product path. The full-information exact solver can validate
+small positions, but the practical solver must evaluate moves from the solver's
+real information state and must not let future players use hidden cards they
+could not know.
 
 ### Belief Set Construction
 
@@ -1072,7 +1117,7 @@ Given public state and solver knowledge, enumerate all hidden deals satisfying:
 
 This should reuse the existing inference constraints where possible.
 
-### Exact Expected Value
+### Exact Hidden-Deal Oracle EV
 
 For each legal solver move:
 
@@ -1086,6 +1131,28 @@ for each hidden_deal in belief_set:
 ```
 
 The best move is the one with highest total.
+
+This remains a validation oracle when the continuation uses full-information
+values. The production imperfect-information solver should instead use
+information-limited continuations, where each future player acts from their own
+private hand and the public history.
+
+### Practical Information-Limited Rollout EV
+
+For each legal solver move:
+
+```text
+sample shared hidden deals from the current public belief
+for each candidate move:
+  for each sampled hidden deal:
+    apply the candidate move in the true sampled world
+    continue the game with rollout_information_limited(...)
+    every simulated player receives only their own hand + public evidence
+  report first-out EV, standard error, timeout rate, and sample count
+```
+
+This is the immediate next implementation target because it matches the
+real-game use case more closely than full-information continuation search.
 
 ### Hidden-Deal Probability
 
@@ -1112,8 +1179,8 @@ Only exhaustive enumeration should be labeled proof-grade.
 
 ## Handling Irrational Opponents
 
-The exact rational solver should not claim that irrational opponents always
-lose. That is too strong, especially in a multiplayer hidden-information game.
+The solver should not claim that irrational opponents always lose. That is too
+strong, especially in a multiplayer hidden-information game.
 
 The defensible claim is:
 
@@ -1130,6 +1197,25 @@ changes what can be inferred.
 
 This captures the practical idea: opponent mistakes do not invalidate the
 solver. They create new states, and the solver remains disciplined.
+
+For the real-game imperfect-information solver, the analogous claim is dynamic
+optimality under the declared belief model:
+
+```text
+At each solver decision point, observe the public history h and private hand,
+update the belief state using the actual plays and passes, and choose the move
+that maximizes first-out EV under the declared information-limited model.
+
+If an opponent makes a move that differs from the modeled policy, the previous
+recommendation is not retroactively guaranteed to be best for that unmodeled
+future. Instead, the deviation becomes new public evidence. The solver updates
+the belief state and re-solves from the new information state.
+```
+
+This lets the project say something stronger than "works only if opponents
+follow the script": the solver remains locally EV-optimal after every observed
+history under its stated model. Opponent deviations are handled by re-solving,
+not by pretending the original plan covered every possible future line.
 
 ## Performance Strategy
 
@@ -1156,21 +1242,55 @@ Not proof-grade unless separately justified:
 The first implementation should prefer clarity over speed. Once the recurrence
 is trusted, optimize representation.
 
+Near-term practical-simulation optimizations:
+
+- reuse one hidden-deal sampler across repeated Monte Carlo samples so
+  count-consistent dynamic-programming tables are built once per public state
+- compare candidate moves over the same sampled hidden deals to reduce variance
+  and avoid repeated sampler setup
+- use 52-bit card masks for public legal cards, table cards, hand masks, and
+  exact-solver cache keys
+- reuse sampled deals across benchmark scenarios when comparing strategy
+  variants on the same public position
+- cache information-limited policy evaluations by public state, private hand,
+  player, and weight set when that policy is deterministic
+- keep exact continuation caches shared across candidate moves and hidden deals
+  for proof-sized oracle evaluations
+- benchmark CPU state throughput before adding GPU-oriented work; the current
+  symbolic search and deal sampling are CPU/RAM-bound, while a 1660 Ti 6GB
+  becomes useful mainly for later neural approximators or GPU-batched rollouts
+
 ## Suggested Implementation Sequence
 
-1. Document the exact full-information objective and tie-breakers in code.
-2. Add canonical full-information state support if the current `GameState` is
-   not sufficient.
-3. Add full-information legal move and transition tests.
-4. Implement the simplest memoized exact solver.
-5. Add certificate output.
-6. Add tiny-state brute-force cross-check tests.
-7. Run exact solver on hand-authored positions.
-8. Compare current heuristic recommendations against exact full-information
-   results on complete known deals.
-9. Add exact hidden-deal enumeration for small public states.
-10. Compute exact imperfect-information expected values for small states.
-11. Keep Monte Carlo as the scalable approximation path for large states.
+Completed foundation:
+
+1. Implement and test the rules engine, legal move generation, transitions, pass
+   inference, and card conservation.
+2. Build constrained hidden-deal sampling/enumeration from public evidence.
+3. Build the exact full-information validation oracle and proof certificates.
+4. Build exact hidden-deal full-information-continuation EV for small belief
+   sets as a second validation oracle.
+5. Add shared sampled deals, reusable sampler state, and bitmask-backed legal
+   and exact-search operations.
+
+Immediate product sequence:
+
+1. Implement `rollout_information_limited(...)`.
+2. In that rollout, give each simulated player only their own hand plus public
+   table/history/count evidence when choosing a move.
+3. Use the existing heuristic scorer as the first deterministic
+   information-limited policy.
+4. Add a softmax policy variant with a rationality parameter, so rollouts can
+   test random, noisy, and greedy opponents with the same score function.
+5. Add `recommend_move_information_limited_monte_carlo(...)`, comparing legal
+   moves over shared hidden deals and reporting EV, standard error, samples,
+   timeout rate, and policy name.
+6. Build exact reduced-state information-limited EV snapshots to validate the
+   sampled rollout behavior where exhaustive evaluation is tractable.
+7. Expand benchmark discovery toward 100k-state exact-oracle cases and larger
+   sampled imperfect-information scenarios with explicit runtime limits.
+8. Treat CFR/public-belief equilibrium methods as later research after the
+   belief sampler and information-limited rollout engine are strong.
 
 ## Acceptance Criteria
 
@@ -1212,8 +1332,22 @@ The project should not claim "true imperfect-information optimality" until:
 - belief updates are part of the recurrence or equilibrium algorithm
 - players do not receive hidden cards they could not know from their own hand
   and public evidence
-- the solution concept is documented, with CFR-style perfect-recall equilibrium
-  solving currently preferred for the final hidden-info solver
+- the solution concept is documented, such as best response to declared
+  information-limited policies, an equilibrium approximation, or another
+  explicit multiplayer hidden-information objective
+
+The project can claim "practical imperfect-information solver" when:
+
+- hidden deals are sampled or enumerated from the documented public belief
+- candidate moves are compared over the same hidden deals when sampling is used
+- every simulated player acts only from their own private hand and public
+  evidence, under a documented information-limited policy
+- the result reports move EV, sample count, uncertainty, timeout rate, and the
+  opponent/self policy used in continuations
+- exact proof-sized information-limited and full-information oracle positions
+  are used as regression checks
+- certificates and reports clearly separate exact proof results from sampled
+  real-game recommendations
 
 The project can claim "Monte Carlo evidence" when:
 
@@ -1229,15 +1363,16 @@ The long-term proof architecture should look like this:
 
 ```text
 Rules engine
-  -> exact full-information solver
-    -> exact hidden-deal full-information-continuation oracle for small belief sets
-      -> information-limited policy EV
-        -> reduced-deck public-belief search for validation
-          -> CFR-style hidden-info solver as the preferred final path
-            -> Monte Carlo approximation for large belief sets
+  -> belief model and constrained hidden-deal sampling/enumeration
+    -> information-limited policies using private hand + public evidence
+      -> sampled practical imperfect-information move EV for real games
+        -> exact information-limited EV on reduced belief states
+          -> exact full-information and hidden-deal oracle validation cases
+            -> reduced-deck public-belief / CFR-style research if needed
               -> heuristic policy tuned and validated against exact/sampled evidence
 ```
 
-The heuristic solver remains valuable because exact play may be too expensive
-for normal interactive use. The proof layer gives it a source of truth to learn
-from, regress against, and explain where approximation begins.
+The heuristic solver remains central because exact play may be too expensive for
+normal interactive use. It should serve as the default information-limited
+policy inside sampled continuations, while the proof layer gives it a source of
+truth to learn from, regress against, and explain where approximation begins.

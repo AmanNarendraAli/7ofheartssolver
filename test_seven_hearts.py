@@ -13,6 +13,10 @@ from seven_hearts import (
     SuitRun,
     apply_known_play,
     build_opponent_model,
+    card_bit,
+    card_from_index,
+    card_index,
+    card_set_mask,
     deal_random_hands,
     endgame_urgency,
     enumerate_hidden_deals,
@@ -28,12 +32,14 @@ from seven_hearts import (
     highest_legal_card_policy,
     initial_state_for_hands,
     lowest_legal_card_policy,
+    mask_to_cards,
     recommend_move,
     recommend_move_exact_imperfect_information,
     recommend_move_monte_carlo,
     rollout_oracle,
     sample_hidden_deal,
     sample_hidden_deals,
+    evaluate_move_monte_carlo_from_deals,
     score_oracle_move,
     score_move,
     choose_rational_move,
@@ -85,6 +91,21 @@ def test_player_legal_moves_are_intersection_of_hand_and_table_legal_cards() -> 
         Card(Suit.HEARTS, 8),
         Card(Suit.SPADES, 7),
     }
+
+
+def test_card_bitmask_round_trip_and_legal_move_mask() -> None:
+    cards = hand("AC 7H KS")
+    mask = card_set_mask(cards)
+
+    assert set(mask_to_cards(mask)) == set(cards)
+    for card in cards:
+        assert card_from_index(card_index(card)) == card
+        assert mask & card_bit(card)
+
+    state = GameState(table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)})
+    legal_mask = card_set_mask(state.legal_moves(hand("6H 9H 7S")))
+
+    assert legal_mask == card_bit(Card(Suit.HEARTS, 6)) | card_bit(Card(Suit.SPADES, 7))
 
 
 def test_pass_removes_then_legal_cards_from_that_opponent_possibilities() -> None:
@@ -450,6 +471,34 @@ def test_recommend_move_monte_carlo_returns_legal_move() -> None:
 
     assert result is not None
     assert result.card in {Card(Suit.HEARTS, 6), Card(Suit.HEARTS, 8)}
+
+
+def test_monte_carlo_can_compare_moves_over_shared_hidden_deals() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(player=0, hand=hand("6H 8H"))
+    deals = sample_hidden_deals(state, knowledge, 3, random.Random(7))
+
+    low_score = evaluate_move_monte_carlo_from_deals(
+        state,
+        knowledge,
+        Card(Suit.HEARTS, 6),
+        deals,
+    )
+    high_score = evaluate_move_monte_carlo_from_deals(
+        state,
+        knowledge,
+        Card(Suit.HEARTS, 8),
+        deals,
+    )
+
+    assert len(deals) == 3
+    assert low_score.samples == 3
+    assert high_score.samples == 3
+    assert low_score.card == Card(Suit.HEARTS, 6)
+    assert high_score.card == Card(Suit.HEARTS, 8)
 
 
 def test_oracle_move_score_penalizes_strong_next_response() -> None:

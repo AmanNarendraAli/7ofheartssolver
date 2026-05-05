@@ -142,6 +142,8 @@ It currently includes:
 - Complete random-deal simulation and aggregate self-play metrics.
 - First-class strategy weight parameters for heuristic and oracle scoring.
 - Shared-deal strategy tuning probes that compare candidate weight sets against baseline opponents.
+- 52-bit card masks for faster legal-card intersections, compact full-information
+  cache keys, and reusable hidden-deal sampling internals.
 - Heuristic move scoring and recommendation through `recommend_move`.
 - Immutable structured score components alongside human-readable score reasons.
 - Structured proof-layer result objects that expose value vectors, move values, best moves, chosen moves, cache statistics, and exhaustive/non-exhaustive status.
@@ -261,11 +263,22 @@ The solver now includes an oracle rollout layer through `rollout_oracle(...)`, `
 
 The Monte Carlo evaluator works as follows:
 
-- Generate a constrained hidden deal from the current public state.
+- Generate constrained hidden deals from the current public state.
 - Apply a candidate legal move for the solver.
 - Continue the game forward using complete sampled hands.
 - On each simulated turn, the acting player chooses a legal move with an oracle greedy policy.
 - Score the candidate by simulated first-out win rate, with average finish margin as a secondary signal and timeouts as a penalty.
+
+`recommend_move_monte_carlo(...)` now compares all legal candidate moves over
+the same sampled hidden deals. This reduces sampling variance between moves and
+avoids rebuilding count-consistent sampler state for every candidate. Direct
+single-move calls to `evaluate_move_monte_carlo(...)` still work; internally
+they use the same reusable sampler path.
+
+The card layer now exposes compact 52-bit masks for card sets. Public table
+cards, public legal cards, full-information hand masks, exact-solver cache keys,
+and hidden-deal sampler holder checks use these masks while the public API still
+returns normal `Card` objects for readability.
 
 The important architectural distinction is that the real solver still does not know opponents' hands. Full hand knowledge is used only inside sampled worlds during rollout. The top-level move estimate is still an expectation over plausible hidden deals, not a full-information assumption about the real game.
 
@@ -334,7 +347,10 @@ Exact hidden-deal oracle results can be rendered with `format_exact_imperfect_in
 
 `proof_benchmark.py` runs fast exact-search benchmarks by default, and
 `proof_benchmark.py --include-hard` adds thousand-state reduced positions for
-measuring the current full-information representation's scaling behavior.
+measuring the current full-information representation's scaling behavior. The
+current hard tier is not intended to be the ceiling: after the bitmask/cache-key
+pass, 100k-state reduced benchmarks are a reasonable next target, with larger
+500k+ cases worth probing under explicit runtime limits.
 
 `proof_eval.py` creates visual engine-quality reports in `proof_reports/`. It
 uses the exact hidden-deal full-information-continuation oracle as a benchmark
@@ -343,7 +359,10 @@ Monte Carlo win rates, and exact EV regret for the practical engines. The CSV
 outputs include both scenario-level choices and per-move rows with heuristic
 components.
 
-This layer is currently intended for small, late-game, or hand-authored proof scenarios. Full-game initial positions still require Monte Carlo or additional exact-search optimization.
+This layer is currently intended for reduced, late-game, or hand-authored proof
+scenarios. It should be scaled beyond the present 4k-state hard benchmark toward
+100k+ state measurements, but full-game initial positions still require Monte
+Carlo or additional exact-search optimization.
 
 ## Benchmark Scenarios
 
@@ -495,16 +514,18 @@ Validation rejects:
 
 The following items are intentionally documented as future work:
 
-- **True imperfect-information optimal solver.** The current exact hidden-deal
+- **Practical imperfect-information solver.** The current exact hidden-deal
   layer is an oracle that reveals each enumerated deal to the continuation
   solver. The final target is a solver where future players act only from their
-  own private hand and public evidence. Near-term steps are exact EV against
-  declared information-limited policies, reduced-deck public-belief search, and
-  later CFR-style methods if the full game needs equilibrium-style play.
+  own private hand and public evidence. Near-term steps are sampled move EV over
+  shared hidden deals with information-limited policies, exact EV against
+  declared information-limited policies on reduced states, and reduced-deck
+  public-belief or CFR-style research later only if the full game needs an
+  equilibrium-style solution concept.
 - **Stronger multi-turn search.** The current rollout policy is greedy with oracle hand knowledge plus a one-ply response adjustment. A deeper search layer could compare candidate continuations recursively rather than choosing only the locally best oracle move at each simulated turn.
 - **Automated weight search.** Constants are still heuristic. The shared-deal tuning harness now provides an objective surface, but it does not yet generate or optimize candidate weight sets automatically.
 - **Endgame policy testing.** Endgame urgency is currently diagnostic only. If self-play shows that late-game move preferences should change, urgency should modulate card-specific components rather than being added as a flat score.
-- **Sampler performance optimization.** Exact count-consistent sampling is principled but can be slow at larger sample counts, especially when many moves and benchmark scenarios are evaluated. Caching sampled deals or reusing samples across candidate moves would reduce demo and search cost.
+- **Sampler and simulation performance optimization.** Exact count-consistent sampling is principled but can be slow at larger sample counts, especially when many benchmark scenarios are evaluated. The Monte Carlo recommender now reuses sampler state and shared sampled deals across candidate moves, and core card-set operations have a bitmask path. Later work can reuse samples across repeated strategy comparisons, move rollout hands to masks, and cache deterministic information-limited policy evaluations.
 
 ## Demo and Tests
 

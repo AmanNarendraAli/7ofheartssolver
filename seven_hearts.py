@@ -17,6 +17,8 @@ class Suit(str, Enum):
     SPADES = "S"
 
 
+SUIT_ORDER = (Suit.CLUBS, Suit.DIAMONDS, Suit.HEARTS, Suit.SPADES)
+SUIT_INDEX = {suit: index for index, suit in enumerate(SUIT_ORDER)}
 RANK_NAMES = {
     1: "A",
     11: "J",
@@ -54,8 +56,41 @@ class Card:
         return self.label()
 
 
+CARD_BY_INDEX = tuple(Card(suit, rank) for suit in SUIT_ORDER for rank in range(1, 14))
+CARD_TO_INDEX = {card: index for index, card in enumerate(CARD_BY_INDEX)}
+FULL_DECK_MASK = (1 << 52) - 1
+
+
+def card_index(card: Card) -> int:
+    return CARD_TO_INDEX[card]
+
+
+def card_bit(card: Card) -> int:
+    return 1 << card_index(card)
+
+
+def card_from_index(index: int) -> Card:
+    return CARD_BY_INDEX[index]
+
+
+def card_set_mask(cards: Iterable[Card]) -> int:
+    mask = 0
+    for card in cards:
+        mask |= card_bit(card)
+    return mask
+
+
+def mask_to_cards(mask: int) -> tuple[Card, ...]:
+    cards: list[Card] = []
+    while mask:
+        bit = mask & -mask
+        cards.append(card_from_index(bit.bit_length() - 1))
+        mask ^= bit
+    return tuple(cards)
+
+
 def full_deck() -> set[Card]:
-    return {Card(suit, rank) for suit in Suit for rank in range(1, 14)}
+    return set(CARD_BY_INDEX)
 
 
 @dataclass(frozen=True)
@@ -92,6 +127,28 @@ class SuitRun:
             return SuitRun(low=self.low, high=rank)
         raise ValueError(f"rank {rank} is not adjacent to run {self.low}-{self.high}")
 
+    def played_mask(self, suit: Suit) -> int:
+        if not self.is_open:
+            return 0
+        assert self.low is not None and self.high is not None
+        base = SUIT_INDEX[suit] * 13
+        mask = 0
+        for rank in range(self.low, self.high + 1):
+            mask |= 1 << (base + rank - 1)
+        return mask
+
+    def legal_mask(self, suit: Suit) -> int:
+        if not self.is_open:
+            return card_bit(Card(suit, 7))
+
+        assert self.low is not None and self.high is not None
+        mask = 0
+        if self.low > 1:
+            mask |= card_bit(Card(suit, self.low - 1))
+        if self.high < 13:
+            mask |= card_bit(Card(suit, self.high + 1))
+        return mask
+
 
 @dataclass(frozen=True)
 class MoveEvent:
@@ -111,26 +168,29 @@ class GameState:
     history: tuple[MoveEvent, ...] = ()
 
     def played_cards(self) -> set[Card]:
-        cards: set[Card] = set()
+        return set(mask_to_cards(self.played_cards_mask()))
+
+    def played_cards_mask(self) -> int:
+        mask = 0
         for suit, run in self.table.items():
-            if not run.is_open:
-                continue
-            assert run.low is not None and run.high is not None
-            cards.update(Card(suit, rank) for rank in range(run.low, run.high + 1))
-        return cards
+            mask |= run.played_mask(suit)
+        return mask
 
     def public_legal_cards(self) -> set[Card]:
-        if not self.played_cards():
-            return {Card(Suit.HEARTS, 7)}
+        return set(mask_to_cards(self.public_legal_mask()))
 
-        legal: set[Card] = set()
+    def public_legal_mask(self) -> int:
+        played_mask = self.played_cards_mask()
+        if not played_mask:
+            return card_bit(Card(Suit.HEARTS, 7))
+
+        legal_mask = 0
         for suit, run in self.table.items():
-            legal.update(run.legal_cards(suit))
-        return legal - self.played_cards()
+            legal_mask |= run.legal_mask(suit)
+        return legal_mask & ~played_mask
 
     def legal_moves(self, hand: Iterable[Card]) -> list[Card]:
-        hand_set = set(hand)
-        return sorted(hand_set & self.public_legal_cards())
+        return list(mask_to_cards(card_set_mask(hand) & self.public_legal_mask()))
 
     def validate_turn(self, hand: Iterable[Card], card: Card | None) -> None:
         legal = set(self.legal_moves(hand))
@@ -179,8 +239,8 @@ class GameState:
         )
 
 
-SUIT_ORDER = (Suit.CLUBS, Suit.DIAMONDS, Suit.HEARTS, Suit.SPADES)
 NEUTRAL_VALUE = (0.0, 0.0, 0.0, 0.0)
+ExactCacheKey = tuple[tuple[int, int, int, int], tuple[tuple[int | None, int | None], ...], int, int | None, int]
 
 
 def canonical_table(table: Mapping[Suit, SuitRun] | None = None) -> tuple[SuitRun, SuitRun, SuitRun, SuitRun]:
@@ -212,6 +272,7 @@ class FullInformationState:
     current_player: int = 0
     winner: int | None = None
     consecutive_passes: int = 0
+    hand_masks: tuple[int, int, int, int] = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if len(self.hands) != 4:
@@ -236,6 +297,7 @@ class FullInformationState:
         overlap = seen & table_cards
         if overlap:
             raise ValueError(f"cards cannot be both in hand and on table: {labels(overlap)}")
+        object.__setattr__(self, "hand_masks", tuple(card_set_mask(hand) for hand in self.hands))
 
     @classmethod
     def from_hands(
@@ -265,16 +327,36 @@ class FullInformationState:
         )
 
     def played_cards(self) -> set[Card]:
-        return GameState(table=self.table_dict()).played_cards()
+        return set(mask_to_cards(self.played_cards_mask()))
+
+    def played_cards_mask(self) -> int:
+        mask = 0
+        for suit, run in zip(SUIT_ORDER, self.table):
+            mask |= run.played_mask(suit)
+        return mask
 
     def public_legal_cards(self) -> set[Card]:
-        return GameState(table=self.table_dict()).public_legal_cards()
+        return set(mask_to_cards(self.public_legal_mask()))
+
+    def public_legal_mask(self) -> int:
+        played_mask = self.played_cards_mask()
+        if not played_mask:
+            return card_bit(Card(Suit.HEARTS, 7))
+
+        legal_mask = 0
+        for suit, run in zip(SUIT_ORDER, self.table):
+            legal_mask |= run.legal_mask(suit)
+        return legal_mask & ~played_mask
 
     def legal_moves(self) -> tuple[Card, ...]:
         if self.winner is not None:
             return ()
-        legal = self.hands[self.current_player] & self.public_legal_cards()
-        return tuple(sorted(legal))
+        legal_mask = self.hand_masks[self.current_player] & self.public_legal_mask()
+        return mask_to_cards(legal_mask)
+
+    def compact_key(self) -> tuple[tuple[int, int, int, int], tuple[tuple[int | None, int | None], ...], int, int | None, int]:
+        table_key = tuple((run.low, run.high) for run in self.table)
+        return self.hand_masks, table_key, self.current_player, self.winner, self.consecutive_passes
 
     def after_action(self, card: Card | None) -> "FullInformationState":
         legal = set(self.legal_moves())
@@ -359,7 +441,7 @@ def terminal_value(winner: int) -> tuple[float, float, float, float]:
 
 
 def solve_full_information(state: FullInformationState) -> ExactSolverResult:
-    cache: dict[FullInformationState, tuple[float, float, float, float]] = {}
+    cache: dict[ExactCacheKey, tuple[float, float, float, float]] = {}
     stats = {
         "states_evaluated": 0,
         "cache_hits": 0,
@@ -416,10 +498,11 @@ def benchmark_full_information_search(name: str, state: FullInformationState) ->
 
 def solve_full_information_value(
     current: FullInformationState,
-    cache: dict[FullInformationState, tuple[float, float, float, float]],
+    cache: dict[ExactCacheKey, tuple[float, float, float, float]],
     stats: dict[str, int],
 ) -> tuple[float, float, float, float]:
-    cached = cache.get(current)
+    cache_key = current.compact_key()
+    cached = cache.get(cache_key)
     if cached is not None:
         stats["cache_hits"] += 1
         return cached
@@ -428,7 +511,7 @@ def solve_full_information_value(
     if current.winner is not None:
         stats["terminal_states"] += 1
         value = terminal_value(current.winner)
-        cache[current] = value
+        cache[cache_key] = value
         return value
 
     legal = current.legal_moves()
@@ -436,11 +519,11 @@ def solve_full_information_value(
         canonical = canonicalize_forced_pass_chain(current)
         if canonical != current:
             value = solve_full_information_value(canonical, cache, stats)
-            cache[current] = value
+            cache[cache_key] = value
             return value
         if canonical.consecutive_passes >= 4:
             stats["deadlock_states"] += 1
-            cache[current] = NEUTRAL_VALUE
+            cache[cache_key] = NEUTRAL_VALUE
             return NEUTRAL_VALUE
 
     child_values = {
@@ -449,7 +532,7 @@ def solve_full_information_value(
     }
     chosen = choose_rational_move(current.current_player, child_values)
     value = child_values[chosen]
-    cache[current] = value
+    cache[cache_key] = value
     return value
 
 
@@ -458,7 +541,7 @@ def solve_full_information_against_policy(
     policy: Callable[[FullInformationState], Card],
     policy_name: str = "fixed_policy",
 ) -> ExactSolverResult:
-    cache: dict[FullInformationState, tuple[float, float, float, float]] = {}
+    cache: dict[ExactCacheKey, tuple[float, float, float, float]] = {}
     stats = {
         "states_evaluated": 0,
         "cache_hits": 0,
@@ -467,7 +550,8 @@ def solve_full_information_against_policy(
     }
 
     def solve_policy_value(current: FullInformationState) -> tuple[float, float, float, float]:
-        cached = cache.get(current)
+        cache_key = current.compact_key()
+        cached = cache.get(cache_key)
         if cached is not None:
             stats["cache_hits"] += 1
             return cached
@@ -476,7 +560,7 @@ def solve_full_information_against_policy(
         if current.winner is not None:
             stats["terminal_states"] += 1
             value = terminal_value(current.winner)
-            cache[current] = value
+            cache[cache_key] = value
             return value
 
         legal = current.legal_moves()
@@ -484,18 +568,18 @@ def solve_full_information_against_policy(
             canonical = canonicalize_forced_pass_chain(current)
             if canonical != current:
                 value = solve_policy_value(canonical)
-                cache[current] = value
+                cache[cache_key] = value
                 return value
             if canonical.consecutive_passes >= 4:
                 stats["deadlock_states"] += 1
-                cache[current] = NEUTRAL_VALUE
+                cache[cache_key] = NEUTRAL_VALUE
                 return NEUTRAL_VALUE
 
         chosen = policy(current)
         if chosen not in legal:
             raise ValueError(f"fixed policy chose illegal move {chosen}; legal moves are {labels(legal)}")
         value = solve_policy_value(current.after_action(chosen))
-        cache[current] = value
+        cache[cache_key] = value
         return value
 
     root_legal = state.legal_moves()
@@ -637,6 +721,121 @@ class HiddenDealEnumeration:
     deals: tuple[HiddenDeal, ...]
     exhaustive: bool
     deal_count: int
+
+
+class HiddenDealSampler:
+    def __init__(self, state: GameState, knowledge: PlayerKnowledge) -> None:
+        self.hidden_cards = tuple(sorted(knowledge.unseen_cards(state)))
+        possible = possible_opponent_cards(state, knowledge)
+        self.possible: dict[int, frozenset[Card]] = {
+            player: frozenset(cards) for player, cards in possible.items()
+        }
+        self.possible_masks = {
+            player: card_set_mask(cards) for player, cards in self.possible.items()
+        }
+        self.holder_options: tuple[tuple[int, ...], ...] = tuple(
+            tuple(player for player, mask in self.possible_masks.items() if mask & card_bit(card))
+            for card in self.hidden_cards
+        )
+        self.valid = all(self.holder_options)
+        self.quota_players: tuple[int, ...] = ()
+        self.initial_quotas: tuple[int, ...] = ()
+        self.quota_index: dict[int, int] = {}
+        self._ways_cache: dict[tuple[int, tuple[int, ...]], int] = {}
+
+        if state.hand_counts is not None:
+            self.quota_players = tuple(
+                player
+                for player in self.possible
+                if state.hand_counts[player] is not None
+            )
+            self.initial_quotas = tuple(int(state.hand_counts[player]) for player in self.quota_players)
+            self.quota_index = {player: index for index, player in enumerate(self.quota_players)}
+            if any(count < 0 for count in self.initial_quotas):
+                self.valid = False
+
+        if self.valid and self.quota_players and self._ways_from(0, self.initial_quotas) == 0:
+            self.valid = False
+
+    def sample(self, rng: random.Random) -> HiddenDeal | None:
+        if not self.valid:
+            return None
+        if self.quota_players:
+            assignment = self._sample_count_consistent_assignment(rng)
+        else:
+            assignment = self._sample_unconstrained_assignment(rng)
+        if assignment is None:
+            return None
+
+        hands: dict[int, set[Card]] = {player: set() for player in self.possible}
+        for card, player in assignment.items():
+            hands[player].add(card)
+
+        return HiddenDeal({player: frozenset(cards) for player, cards in hands.items()})
+
+    def _next_quota_state(self, state: tuple[int, ...], holder: int) -> tuple[int, ...] | None:
+        index = self.quota_index.get(holder)
+        if index is None:
+            return state
+        if state[index] == 0:
+            return None
+        values = list(state)
+        values[index] -= 1
+        return tuple(values)
+
+    def _ways_from(self, index: int, quota_state: tuple[int, ...]) -> int:
+        cache_key = (index, quota_state)
+        cached = self._ways_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if index == len(self.hidden_cards):
+            total = 1 if all(value == 0 for value in quota_state) else 0
+        else:
+            total = 0
+            for holder in self.holder_options[index]:
+                state_after = self._next_quota_state(quota_state, holder)
+                if state_after is not None:
+                    total += self._ways_from(index + 1, state_after)
+        self._ways_cache[cache_key] = total
+        return total
+
+    def _sample_unconstrained_assignment(self, rng: random.Random) -> dict[Card, int] | None:
+        assignment: dict[Card, int] = {}
+        for card, holders in zip(self.hidden_cards, self.holder_options):
+            if not holders:
+                return None
+            assignment[card] = rng.choice(holders)
+        return assignment
+
+    def _sample_count_consistent_assignment(self, rng: random.Random) -> dict[Card, int] | None:
+        quota_state = self.initial_quotas
+        if self._ways_from(0, quota_state) == 0:
+            return None
+
+        assignment: dict[Card, int] = {}
+        for index, card in enumerate(self.hidden_cards):
+            weighted_holders: list[tuple[int, tuple[int, ...], int]] = []
+            for holder in self.holder_options[index]:
+                state_after = self._next_quota_state(quota_state, holder)
+                if state_after is None:
+                    continue
+                ways = self._ways_from(index + 1, state_after)
+                if ways:
+                    weighted_holders.append((holder, state_after, ways))
+
+            total = sum(ways for _, _, ways in weighted_holders)
+            if total == 0:
+                return None
+            pick = rng.randrange(total)
+            running = 0
+            for holder, state_after, ways in weighted_holders:
+                running += ways
+                if pick < running:
+                    assignment[card] = holder
+                    quota_state = state_after
+                    break
+
+        return assignment
 
 
 @dataclass(frozen=True)
@@ -906,24 +1105,7 @@ def sample_hidden_deal(
     rng: random.Random | None = None,
 ) -> HiddenDeal | None:
     rng = rng or random.Random()
-    hidden_cards = sorted(knowledge.unseen_cards(state))
-    possible = possible_opponent_cards(state, knowledge)
-
-    if state.hand_counts is not None and any(
-        count is not None for player, count in enumerate(state.hand_counts) if player in possible
-    ):
-        assignment = sample_count_consistent_assignment(possible, state.hand_counts, hidden_cards, rng)
-    else:
-        assignment = sample_unconstrained_assignment(possible, hidden_cards, rng)
-
-    if assignment is None:
-        return None
-
-    hands: dict[int, set[Card]] = {player: set() for player in possible}
-    for card, player in assignment.items():
-        hands[player].add(card)
-
-    return HiddenDeal({player: frozenset(cards) for player, cards in hands.items()})
+    return HiddenDealSampler(state, knowledge).sample(rng)
 
 
 def sample_hidden_deals(
@@ -933,9 +1115,10 @@ def sample_hidden_deals(
     rng: random.Random | None = None,
 ) -> tuple[HiddenDeal, ...]:
     rng = rng or random.Random()
+    sampler = HiddenDealSampler(state, knowledge)
     deals: list[HiddenDeal] = []
     for _ in range(count):
-        deal = sample_hidden_deal(state, knowledge, rng)
+        deal = sampler.sample(rng)
         if deal is None:
             break
         deals.append(deal)
@@ -1041,7 +1224,7 @@ def evaluate_move_exact_imperfect_information_from_deals(
     knowledge: PlayerKnowledge,
     card: Card,
     enumeration: HiddenDealEnumeration,
-    exact_cache: dict[FullInformationState, tuple[float, float, float, float]] | None = None,
+    exact_cache: dict[ExactCacheKey, tuple[float, float, float, float]] | None = None,
     exact_stats: dict[str, int] | None = None,
 ) -> ExactImperfectInformationMoveScore:
     if state.current_player != knowledge.player:
@@ -1112,7 +1295,7 @@ def recommend_move_exact_imperfect_information(
         return None
 
     enumeration = enumerate_hidden_deals(state, knowledge, max_deals=max_deals)
-    exact_cache: dict[FullInformationState, tuple[float, float, float, float]] = {}
+    exact_cache: dict[ExactCacheKey, tuple[float, float, float, float]] = {}
     exact_stats = {
         "states_evaluated": 0,
         "cache_hits": 0,
@@ -1297,8 +1480,9 @@ def recommend_move_monte_carlo(
         return None
 
     rng = rng or random.Random()
+    hidden_deals = sample_hidden_deals(state, knowledge, samples_per_move, rng)
     results = [
-        evaluate_move_monte_carlo(state, knowledge, card, samples_per_move, max_turns, rng, weights)
+        evaluate_move_monte_carlo_from_deals(state, knowledge, card, hidden_deals, max_turns, weights)
         for card in legal
     ]
     return max(results, key=lambda result: result.score)
@@ -1314,17 +1498,25 @@ def evaluate_move_monte_carlo(
     weights: StrategyWeights = DEFAULT_WEIGHTS,
 ) -> MonteCarloMoveScore:
     rng = rng or random.Random()
+    hidden_deals = sample_hidden_deals(state, knowledge, samples, rng)
+    return evaluate_move_monte_carlo_from_deals(state, knowledge, card, hidden_deals, max_turns, weights)
+
+
+def evaluate_move_monte_carlo_from_deals(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    card: Card,
+    hidden_deals: Iterable[HiddenDeal],
+    max_turns: int = 200,
+    weights: StrategyWeights = DEFAULT_WEIGHTS,
+) -> MonteCarloMoveScore:
     wins = 0
     finish_margin_total = 0.0
     turns_total = 0
     timeouts = 0
     completed_samples = 0
 
-    for _ in range(samples):
-        hidden_deal = sample_hidden_deal(state, knowledge, rng)
-        if hidden_deal is None:
-            break
-
+    for hidden_deal in hidden_deals:
         hands = complete_hands(knowledge, hidden_deal)
         if card not in hands[knowledge.player]:
             continue
