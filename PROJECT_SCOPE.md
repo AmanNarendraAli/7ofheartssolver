@@ -138,7 +138,7 @@ It currently includes:
 - Oracle greedy rollouts and Monte Carlo move evaluation over sampled hidden deals.
 - Exact full-information rational-play solving for small/late-game complete-hand states.
 - Exact full-information fixed-policy solving for comparing against declared opponent policies.
-- Exhaustive hidden-deal enumeration and exact imperfect-information expected value when the belief set is small enough.
+- Exhaustive hidden-deal enumeration and exact expected value under full-information rational continuation when the belief set is small enough.
 - Complete random-deal simulation and aggregate self-play metrics.
 - First-class strategy weight parameters for heuristic and oracle scoring.
 - Shared-deal strategy tuning probes that compare candidate weight sets against baseline opponents.
@@ -320,17 +320,28 @@ The exact layer also includes `solve_full_information_against_policy(...)`, whic
 
 Exact solver results can be rendered with `format_exact_solver_certificate(...)`, which prints the assumptions, legal moves, value vectors, selected move, tie-break rule, and search statistics.
 
-The imperfect-information exact layer uses `enumerate_hidden_deals(...)`, `evaluate_move_exact_imperfect_information(...)`, and `recommend_move_exact_imperfect_information(...)`.
+The hidden-deal oracle layer uses `enumerate_hidden_deals(...)`, `evaluate_move_exact_imperfect_information(...)`, and `recommend_move_exact_imperfect_information(...)`.
 
-It computes exact expected value only when all hidden deals consistent with the public evidence are enumerated. Candidate moves now share one hidden-deal enumeration and one exact continuation cache, so exact recommendation avoids recomputing the same belief set and common continuations for every legal card. If `max_deals` truncates enumeration, the result is explicitly marked non-exhaustive and should be treated as diagnostic rather than proof. Because truncation is a deterministic prefix of the enumeration, it does not report a statistical standard error.
+It computes exact expected value only when all hidden deals consistent with the public evidence are enumerated, but the continuation is full-information rational play after each hidden deal is materialized. This is useful as a proof oracle for judging practical engines; it is not the final true imperfect-information optimal solver. Candidate moves now share one hidden-deal enumeration and one exact continuation cache, so exact recommendation avoids recomputing the same belief set and common continuations for every legal card. If `max_deals` truncates enumeration, the result is explicitly marked non-exhaustive and should be treated as diagnostic rather than proof. Because truncation is a deterministic prefix of the enumeration, it does not report a statistical standard error.
 
-Exact imperfect-information results can be rendered with `format_exact_imperfect_information_certificate(...)`.
+Exact hidden-deal oracle results can be rendered with `format_exact_imperfect_information_certificate(...)`. Certificates state the full-information continuation model, expected value vectors, outcome counts, and shared exact-search statistics.
 
 `proof_demo.py` prints small proof certificates for:
 
 - rational full-information play
 - fixed-policy full-information play
-- exact hidden-deal expected value
+- exact hidden-deal expected value with full-information continuation
+
+`proof_benchmark.py` runs fast exact-search benchmarks by default, and
+`proof_benchmark.py --include-hard` adds thousand-state reduced positions for
+measuring the current full-information representation's scaling behavior.
+
+`proof_eval.py` creates visual engine-quality reports in `proof_reports/`. It
+uses the exact hidden-deal full-information-continuation oracle as a benchmark
+for proof-sized positions, then plots exact move values, heuristic move scores,
+Monte Carlo win rates, and exact EV regret for the practical engines. The CSV
+outputs include both scenario-level choices and per-move rows with heuristic
+components.
 
 This layer is currently intended for small, late-game, or hand-authored proof scenarios. Full-game initial positions still require Monte Carlo or additional exact-search optimization.
 
@@ -484,6 +495,12 @@ Validation rejects:
 
 The following items are intentionally documented as future work:
 
+- **True imperfect-information optimal solver.** The current exact hidden-deal
+  layer is an oracle that reveals each enumerated deal to the continuation
+  solver. The final target is a solver where future players act only from their
+  own private hand and public evidence. Near-term steps are exact EV against
+  declared information-limited policies, reduced-deck public-belief search, and
+  later CFR-style methods if the full game needs equilibrium-style play.
 - **Stronger multi-turn search.** The current rollout policy is greedy with oracle hand knowledge plus a one-ply response adjustment. A deeper search layer could compare candidate continuations recursively rather than choosing only the locally best oracle move at each simulated turn.
 - **Automated weight search.** Constants are still heuristic. The shared-deal tuning harness now provides an objective surface, but it does not yet generate or optimize candidate weight sets automatically.
 - **Endgame policy testing.** Endgame urgency is currently diagnostic only. If self-play shows that late-game move preferences should change, urgency should modulate card-specific components rather than being added as a flat score.
@@ -510,11 +527,19 @@ Current verification:
 
 ```text
 py run_tests.py
-56 tests passed
+74 tests passed
 ```
 
 Current demo command:
 
 ```text
 py demo.py
+```
+
+Current proof benchmark commands:
+
+```text
+py proof_benchmark.py
+py proof_benchmark.py --include-hard
+py proof_eval.py
 ```

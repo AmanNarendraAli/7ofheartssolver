@@ -7,8 +7,8 @@ The central idea is to separate three claims:
 
 1. The rules engine represents the real game correctly.
 2. A full-information solver exactly solves the finite game tree.
-3. An imperfect-information solver chooses the best expected move over all
-   hidden deals consistent with public evidence.
+3. A future true imperfect-information solver chooses the best expected move
+   while every player acts only from their own private hand and public evidence.
 
 The current project already has useful heuristic, inference, sampling, and
 rollout layers. Those are evidence-producing systems. A proof-grade solver needs
@@ -36,29 +36,76 @@ Implemented:
 - `enumerate_hidden_deals(...)`, an exhaustive hidden-deal enumerator with an
   optional `max_deals` guard
 - `evaluate_move_exact_imperfect_information(...)`, exact expected value for a
-  candidate move when hidden deals are exhaustively enumerated
+  candidate move when hidden deals are exhaustively enumerated and continuations
+  are evaluated with full-information rational play
 - `recommend_move_exact_imperfect_information(...)`, exact or explicitly
-  non-exhaustive hidden-information recommendation reporting
+  non-exhaustive hidden-deal recommendation reporting under the full-
+  information-continuation oracle model
 - shared hidden-deal enumeration across all candidate moves in exact
   imperfect-information recommendation
 - shared exact continuation cache across candidate moves and hidden deals in an
   exact imperfect-information recommendation
-- human-readable certificate formatting for exact imperfect-information results
+- human-readable certificate formatting for exact hidden-deal EV results,
+  including the continuation-model caveat, expected value vectors, outcome
+  counts, and shared search statistics
 - `proof_demo.py`, a command-line proof harness that prints exact certificates
+- `proof_benchmark.py`, a command-line benchmark harness for exact full-
+  information search counters and throughput
+- `proof_eval.py`, a command-line visual engine-quality report comparing
+  heuristic and Monte Carlo choices against the exact hidden-deal full-
+  information-continuation EV oracle
+- pass-chain canonicalization for forced-pass runs in exact full-information
+  solving
+- declared reduced decks for proof-sized `PlayerKnowledge` hidden-deal tests
+- public trailing-pass materialization in `FullInformationState.from_hands(...)`
+- defensive legal-move invariance checks for materialized hidden deals
 - proof-layer tests for immediate wins, forced passes, rational avoidance of
   opening a next-player win, deterministic ties, brute-force cross-checking,
   fixed-policy solving, certificate output, hidden-deal enumeration, exact EV,
   and non-exhaustive limits
+- randomized tiny-state brute-force cross-checking across generated reachable
+  reduced games
+- conservation-walk fuzz tests across random full-deck simulated games
+- exact-solver certificate snapshot regression tests for hand-authored proof
+  positions
+- exact imperfect-information certificate snapshot regression for a reduced
+  belief position with two candidate moves and different expected values
+- `proof_demo.py` includes the reduced-belief exact EV certificate so the
+  visible proof harness shows a multi-move hidden-information choice
+- exact imperfect-information certificate snapshot regression for a multi-suit
+  reduced belief position with four candidate moves and 90 hidden deals
+- `proof_demo.py` includes the multi-suit exact EV certificate
+- `proof_benchmark.py` now has an opt-in hard tier with thousand-state reduced
+  exact-search positions
+- hidden-deal enumeration regression tests for pass constraints, known hand
+  counts, and impossible constraint/count combinations
+- regression coverage that non-exhaustive exact recommendation reuses the same
+  truncated hidden-deal set across all candidate moves
+- regression coverage that full-information materialization derives trailing
+  public pass counts
+- regression coverage that proof benchmark tiers expose the intended hard
+  positions and that a hard position reaches thousand-state exact-search scale
+- regression coverage that proof evaluation reports exact EV regret for
+  practical engine choices
+- regression coverage for deadlock handling, root forced-pass reporting,
+  forced-pass-chain equivalence, played-card ownership during hidden-deal
+  enumeration, and vector-aware hidden-deal EV tie-breaking
 
 Current verification:
 
 ```text
 py run_tests.py
-56 tests passed
+74 tests passed
 
 py proof_demo.py
 
-py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py
+py proof_benchmark.py
+
+py proof_benchmark.py --include-hard
+
+py proof_eval.py
+
+py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py
 ```
 
 Important current limitations:
@@ -68,22 +115,40 @@ Important current limitations:
 - deadlocks are counted and given neutral value; valid normal games should not
   hit them before first-out
 - exact imperfect-information evaluation is proof-grade only when
-  `exhaustive=True`
+  `exhaustive=True`, and even then it is exact only for the declared full-
+  information-continuation oracle model
+- the current hidden-deal EV oracle is not the final true imperfect-information
+  optimal solver: after each hidden deal is materialized, all players are solved
+  as if they can see the full deal
 - when `max_deals` truncates hidden-deal enumeration, the result is diagnostic
   rather than proof-grade; because truncation is deterministic, no statistical
   standard error is reported for truncated exact-enumeration results
 - hidden-deal enumeration currently uses the existing public constraint model
   and a uniform prior over enumerated deals
+- naive broad searches for harder hidden-belief proof positions can be very
+  slow; one ad hoc multi-suit exploratory search timed out after roughly 23
+  minutes without finding a useful position. Future position discovery should
+  use bounded tooling with explicit limits, progress reporting, and abort
+  controls.
 
-Highest-priority proof work after the initial implementation:
+Highest-priority proof work after the current proof pass:
 
-1. Add randomized tiny-state brute-force cross-checking across many generated
-   reachable reduced games.
-2. Add conservation-walk fuzz tests across random simulated games.
-3. Add regression certificate snapshots for several hand-authored proof
-   positions.
-4. Add pass-chain canonicalization as a proof-preserving optimization.
-5. Consider bitmask state representation for deeper exact search.
+1. Build the next information-limited evaluation mode: exact EV against declared
+   policies that use only each player's private hand and public evidence.
+2. Treat CFR/perfect-recall extensive-form solving as the preferred long-term
+   path for the true hidden-information solver. Use reduced-deck public-belief
+   search and information-limited policy EV as stepping stones and validation
+   tools, not as the final solution concept.
+3. Extend harder benchmark discovery toward tens of thousands and eventually
+   millions of states, with explicit runtime limits and progress reporting, so
+   the current representation's scale wall is measured more completely.
+4. Consider bitmask state representation for deeper exact search.
+5. Add deeper hidden-deal enumeration regression tests around multi-pass
+   histories.
+6. Add more hand-authored imperfect-information snapshots with 3-5 cards per
+   opponent and multiple public pass constraints.
+7. Grow `proof_eval.py` into a broader engine scoreboard with more exact
+   positions, repeated Monte Carlo seeds, and trend snapshots.
 
 ## Formal Model
 
@@ -452,7 +517,7 @@ The materialized state must have:
 - the public current player
 - no extra hidden information beyond `h`
 
-### Imperfect-Information Expected Value
+### Hidden-Deal Full-Information-Continuation EV
 
 For solver player `i` and candidate legal action `a`, define:
 
@@ -462,9 +527,12 @@ EV_i(P, a) =
 ```
 
 where `V` is the full-information value function under the declared continuation
-model.
+model. In the current implementation, that continuation model is full-
+information rational play after each hidden deal is materialized. This is an
+exact oracle for evaluating moves against fully revealed continuations; it is
+not a true sequential imperfect-information optimum.
 
-The exact imperfect-information optimal policy is:
+The exact hidden-deal oracle policy is:
 
 ```text
 Pi*(P) = argmax_{a in A_card(M(P, h), i)} EV_i(P, a)
@@ -480,6 +548,24 @@ tie-breaker:
 ```text
 Tau(P, tied_actions) -> a*
 ```
+
+The implementation now computes an expected value vector for every candidate
+move and uses the same vector-aware tie-break structure as full-information
+rational play.
+
+### True Imperfect-Information Target
+
+The final project goal is stronger than the current hidden-deal oracle. A true
+imperfect-information solver must evaluate future play where every player acts
+from their own private hand plus public evidence, not from the fully materialized
+deal.
+
+Near-term bridge targets:
+
+- exact EV against declared information-limited policies
+- reduced-deck public-belief search where belief updates are part of the state
+- CFR or another perfect-recall extensive-form method, with CFR currently the
+  preferred final path for larger true hidden-information play
 
 ### Sampling Approximation
 
@@ -1108,8 +1194,8 @@ when:
 - exact solver tests pass
 - certificates show the selected move is best under that model
 
-The project can claim "exact expected-optimal under imperfect information" for a
-specific position when:
+The project can claim "exact hidden-deal EV under full-information
+continuation" for a specific position when:
 
 - every hidden deal consistent with public evidence is enumerated
 - the hidden-deal prior is documented
@@ -1117,6 +1203,17 @@ specific position when:
 - each candidate move's expected value is computed exactly
 - the final certificate reports the hidden deal count and expected value of each
   legal move
+- the certificate clearly states that players use full-information rational
+  continuation after each materialized deal
+
+The project should not claim "true imperfect-information optimality" until:
+
+- future players' information sets are modeled explicitly
+- belief updates are part of the recurrence or equilibrium algorithm
+- players do not receive hidden cards they could not know from their own hand
+  and public evidence
+- the solution concept is documented, with CFR-style perfect-recall equilibrium
+  solving currently preferred for the final hidden-info solver
 
 The project can claim "Monte Carlo evidence" when:
 
@@ -1133,9 +1230,12 @@ The long-term proof architecture should look like this:
 ```text
 Rules engine
   -> exact full-information solver
-    -> exact hidden-deal expectation for small belief sets
-      -> Monte Carlo approximation for large belief sets
-        -> heuristic policy tuned and validated against exact/sampled evidence
+    -> exact hidden-deal full-information-continuation oracle for small belief sets
+      -> information-limited policy EV
+        -> reduced-deck public-belief search for validation
+          -> CFR-style hidden-info solver as the preferred final path
+            -> Monte Carlo approximation for large belief sets
+              -> heuristic policy tuned and validated against exact/sampled evidence
 ```
 
 The heuristic solver remains valuable because exact play may be too expensive

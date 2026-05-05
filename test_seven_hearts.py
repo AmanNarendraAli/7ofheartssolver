@@ -11,6 +11,7 @@ from seven_hearts import (
     StrategyWeights,
     Suit,
     SuitRun,
+    apply_known_play,
     build_opponent_model,
     deal_random_hands,
     endgame_urgency,
@@ -23,6 +24,7 @@ from seven_hearts import (
     format_exact_solver_certificate,
     future_chain_impact,
     full_deck,
+    hand_count_tuple,
     highest_legal_card_policy,
     initial_state_for_hands,
     lowest_legal_card_policy,
@@ -35,11 +37,14 @@ from seven_hearts import (
     score_oracle_move,
     score_move,
     choose_rational_move,
+    choose_expected_value_vector_move,
     solve_full_information,
     solve_full_information_against_policy,
     simulate_complete_game,
     time_to_playable,
 )
+from proof_benchmark import FAST_BENCHMARKS, HARD_BENCHMARKS, benchmark_positions, hard_benchmark_positions
+from proof_eval import evaluate_scenario, evaluation_scenarios
 
 
 def hand(text: str) -> frozenset[Card]:
@@ -643,6 +648,72 @@ def test_full_information_exact_solver_follows_forced_pass_chain() -> None:
     assert result.deadlock_states == 0
 
 
+def test_full_information_solver_reports_deadlock_state() -> None:
+    state = FullInformationState.from_hands(
+        {
+            0: hand("AC"),
+            1: hand("AD"),
+            2: hand("AS"),
+            3: hand("2C"),
+        },
+        GameState(
+            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+            current_player=0,
+        ),
+        consecutive_passes=4,
+    )
+
+    result = solve_full_information(state)
+
+    assert result.value == (0.0, 0.0, 0.0, 0.0)
+    assert result.deadlock_states == 1
+
+
+def test_full_information_root_forced_pass_has_no_chosen_move() -> None:
+    state = FullInformationState.from_hands(
+        {
+            0: hand("AC"),
+            1: hand("AD"),
+            2: hand("6H"),
+            3: hand("AS"),
+        },
+        GameState(
+            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+            current_player=0,
+        ),
+    )
+
+    result = solve_full_information(state)
+
+    assert state.legal_moves() == ()
+    assert result.chosen_move is None
+    assert result.best_moves == ()
+    assert result.value == solve_full_information(state.after_action(None)).value
+
+
+def test_forced_pass_chain_canonicalization_preserves_value() -> None:
+    state = FullInformationState.from_hands(
+        {
+            0: hand("AC"),
+            1: hand("AD"),
+            2: hand("AS"),
+            3: hand("6H"),
+        },
+        GameState(
+            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+            current_player=0,
+        ),
+    )
+
+    first_pass = state.after_action(None)
+    second_pass = first_pass.after_action(None)
+    third_pass = second_pass.after_action(None)
+
+    assert solve_full_information(state).value == solve_full_information(first_pass).value
+    assert solve_full_information(state).value == solve_full_information(second_pass).value
+    assert solve_full_information(state).value == solve_full_information(third_pass).value
+
+
 def test_full_information_exact_solver_avoids_opening_next_player_win() -> None:
     state = FullInformationState.from_hands(
         {
@@ -702,6 +773,26 @@ def brute_force_full_information_value(state: FullInformationState) -> tuple[flo
     return move_values[chosen]
 
 
+def random_reduced_full_information_state(rng: random.Random) -> tuple[FullInformationState, frozenset[Card]]:
+    deck = tuple(hand("5H 6H 7H 8H 9H 7C 7D 7S"))
+    shuffled = list(deck)
+    rng.shuffle(shuffled)
+    hands = {player: set(shuffled[player * 2 : (player + 1) * 2]) for player in range(4)}
+    current_player = next(player for player, cards in hands.items() if Card(Suit.HEARTS, 7) in cards)
+    state = FullInformationState.from_hands(
+        hands,
+        GameState(current_player=current_player),
+    )
+
+    for _ in range(rng.randrange(5)):
+        if state.winner is not None:
+            break
+        legal = state.legal_moves()
+        state = state.after_action(rng.choice(legal) if legal else None)
+
+    return state, frozenset(deck)
+
+
 def test_full_information_memoized_solver_matches_tiny_brute_force() -> None:
     state = FullInformationState.from_hands(
         {
@@ -723,6 +814,129 @@ def test_full_information_memoized_solver_matches_tiny_brute_force() -> None:
     assert result.terminal_states > 0
 
 
+def test_full_information_memoized_solver_matches_random_tiny_brute_force() -> None:
+    rng = random.Random(12)
+
+    for _ in range(40):
+        state, deck = random_reduced_full_information_state(rng)
+        state.assert_card_conservation(deck)
+
+        result = solve_full_information(state)
+
+        assert result.value == brute_force_full_information_value(state)
+        assert result.chosen_move in state.legal_moves() or result.chosen_move is None
+        assert result.deadlock_states == 0
+
+
+def test_random_full_game_walk_preserves_conservation_and_table_invariants() -> None:
+    rng = random.Random(13)
+
+    for _ in range(8):
+        hands = deal_random_hands(rng)
+        state = initial_state_for_hands(hands)
+        seen_hand_counts = hand_count_tuple(hands)
+
+        for _ in range(80):
+            full_state = FullInformationState.from_hands(hands, state)
+            full_state.assert_card_conservation()
+            assert state.hand_counts == seen_hand_counts
+            assert set().union(*hands.values()).isdisjoint(state.played_cards())
+
+            for suit, run in state.table.items():
+                if run.is_open:
+                    assert run.low is not None and run.high is not None
+                    assert run.low <= 7 <= run.high
+                    assert all(Card(suit, rank) in state.played_cards() for rank in range(run.low, run.high + 1))
+
+            if full_state.winner is not None:
+                break
+
+            player = state.current_player
+            legal = state.legal_moves(hands[player])
+            card = rng.choice(legal) if legal else None
+            previous_count = len(hands[player])
+            state, hands = apply_known_play(state, hands, player, card)
+            seen_hand_counts = hand_count_tuple(hands)
+
+            if card is None:
+                assert len(hands[player]) == previous_count
+            else:
+                assert len(hands[player]) == previous_count - 1
+                assert card in state.played_cards()
+
+
+def test_exact_solver_certificate_snapshot_for_rational_proof_position() -> None:
+    state = FullInformationState.from_hands(
+        {
+            0: hand("6H 7S"),
+            1: hand("5H"),
+            2: hand("AC"),
+            3: hand("AD"),
+        },
+        GameState(
+            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+            current_player=0,
+        ),
+    )
+
+    certificate = format_exact_solver_certificate(state, solve_full_information(state))
+
+    assert certificate == "\n".join(
+        [
+            "Exact full-information certificate",
+            "policy: full_information_rational_first_out",
+            "current_player: P0",
+            "hand_counts: (2, 1, 1, 1)",
+            "legal_moves: [6H, 7S]",
+            "value: (P0=1.000, P1=0.000, P2=0.000, P3=0.000)",
+            "best_moves: [7S]",
+            "chosen_move: 7S",
+            "exhaustive: True",
+            "search: states=6, cache_hits=2, terminals=2, deadlocks=0",
+            "tie_break: maximize acting player's first-out value; then minimize next player's value; then minimize strongest opponent value; then deterministic card order",
+            "move_values:",
+            "    6H: (P0=0.000, P1=1.000, P2=0.000, P3=0.000)",
+            "  * 7S: (P0=1.000, P1=0.000, P2=0.000, P3=0.000)",
+        ]
+    )
+
+
+def test_exact_solver_certificate_snapshot_for_fixed_policy_position() -> None:
+    state = FullInformationState.from_hands(
+        {
+            0: hand("6H 8H"),
+            1: hand("AC"),
+            2: hand("9H"),
+            3: hand("AD"),
+        },
+        GameState(
+            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+            current_player=0,
+        ),
+    )
+
+    certificate = format_exact_solver_certificate(state, solve_full_information_against_policy(state, highest_legal_card_policy))
+
+    assert certificate == "\n".join(
+        [
+            "Exact full-information certificate",
+            "policy: fixed_policy",
+            "current_player: P0",
+            "hand_counts: (2, 1, 1, 1)",
+            "legal_moves: [6H, 8H]",
+            "value: (P0=1.000, P1=0.000, P2=0.000, P3=0.000)",
+            "best_moves: [6H]",
+            "chosen_move: 6H",
+            "exhaustive: True",
+            "search: states=6, cache_hits=0, terminals=2, deadlocks=0",
+            "tie_break: root chooses best move against fixed future policy; tied root moves use deterministic card order",
+            "move_values:",
+            "  * 6H: (P0=1.000, P1=0.000, P2=0.000, P3=0.000)",
+            "    8H: (P0=0.000, P1=0.000, P2=1.000, P3=0.000)",
+        ]
+    )
+
+
 def test_enumerate_hidden_deals_exhausts_count_consistent_small_belief_set() -> None:
     table_state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -742,6 +956,74 @@ def test_enumerate_hidden_deals_exhausts_count_consistent_small_belief_set() -> 
     assert all(len(deal.hand(3)) == 0 for deal in enumeration.deals)
 
 
+def test_enumerate_hidden_deals_respects_pass_constraints_with_known_counts() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(1, 1, 2, 2),
+        current_player=0,
+        history=(MoveEvent(0, Card(Suit.HEARTS, 7)), MoveEvent(1, None)),
+    )
+    knowledge = PlayerKnowledge(
+        player=0,
+        hand=hand("5H"),
+        deck=hand("5H 7H 6H 8H AC AD AS"),
+    )
+
+    enumeration = enumerate_hidden_deals(state, knowledge)
+
+    assert enumeration.exhaustive
+    assert enumeration.deal_count == 18
+    assert all(Card(Suit.HEARTS, 6) not in deal.hand(1) for deal in enumeration.deals)
+    assert all(Card(Suit.HEARTS, 8) not in deal.hand(1) for deal in enumeration.deals)
+    assert all(len(deal.hand(1)) == 1 for deal in enumeration.deals)
+    assert all(len(deal.hand(2)) == 2 for deal in enumeration.deals)
+    assert all(len(deal.hand(3)) == 2 for deal in enumeration.deals)
+
+
+def test_enumerate_hidden_deals_respects_played_card_ownership_history() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=6, high=7)},
+        hand_counts=(1, 0, 1, 1),
+        current_player=0,
+        history=(
+            MoveEvent(0, Card(Suit.HEARTS, 7)),
+            MoveEvent(1, Card(Suit.HEARTS, 6)),
+        ),
+    )
+    knowledge = PlayerKnowledge(
+        player=0,
+        hand=hand("5H"),
+        deck=hand("5H 6H 7H AC AD"),
+    )
+
+    enumeration = enumerate_hidden_deals(state, knowledge)
+
+    assert enumeration.exhaustive
+    assert enumeration.deal_count == 2
+    assert all(Card(Suit.HEARTS, 6) not in deal.hand(2) for deal in enumeration.deals)
+    assert all(Card(Suit.HEARTS, 6) not in deal.hand(3) for deal in enumeration.deals)
+
+
+def test_enumerate_hidden_deals_returns_zero_when_pass_constraints_conflict_with_counts() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(1, 1, 1, 0),
+        current_player=0,
+        history=(MoveEvent(0, Card(Suit.HEARTS, 7)), MoveEvent(1, None)),
+    )
+    knowledge = PlayerKnowledge(
+        player=0,
+        hand=hand("5H"),
+        deck=hand("5H 7H 6H 8H"),
+    )
+
+    enumeration = enumerate_hidden_deals(state, knowledge)
+
+    assert enumeration.exhaustive
+    assert enumeration.deal_count == 0
+    assert enumeration.deals == ()
+
+
 def test_exact_imperfect_information_move_value_is_exact_for_immediate_win() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -756,6 +1038,148 @@ def test_exact_imperfect_information_move_value_is_exact_for_immediate_win() -> 
     assert score.hidden_deals == 2450
     assert score.expected_value == 1.0
     assert score.value_standard_error == 0.0
+
+
+def test_exact_imperfect_information_certificate_snapshot_for_reduced_belief_position() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(3, 2, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        player=0,
+        hand=hand("5H 6H 8H"),
+        deck=hand("5H 6H 7H 8H 9H 7C AC AD"),
+    )
+
+    result = recommend_move_exact_imperfect_information(state, knowledge)
+    assert result is not None
+    certificate = format_exact_imperfect_information_certificate(state, knowledge, result)
+
+    assert certificate == "\n".join(
+        [
+            "Exact imperfect-information certificate",
+            "policy: exact_hidden_deal_expectation_with_full_information_rational_continuation",
+            "continuation_model: opponents play full-information rationally from each materialized hidden deal",
+            "solver_player: P0",
+            "current_player: P0",
+            "solver_hand: [5H, 6H, 8H]",
+            "hand_counts: (3, 2, 1, 1)",
+            "legal_moves: [6H, 8H]",
+            "hidden_deals: 12",
+            "exhaustive: True",
+            "best_moves: [6H]",
+            "chosen_move: 6H",
+            "search: states=112, cache_hits=8, terminals=24, deadlocks=0",
+            "move_expected_values:",
+            "  * 6H: EV=0.500, vector=(P0=0.500, P1=0.000, P2=0.250, P3=0.250), outcomes=(P0=6, P1=0, P2=3, P3=3, neutral=0), deals=12, exhaustive=True, se=0.000",
+            "    8H: EV=0.000, vector=(P0=0.000, P1=0.167, P2=0.500, P3=0.333), outcomes=(P0=0, P1=2, P2=6, P3=4, neutral=0), deals=12, exhaustive=True, se=0.000",
+        ]
+    )
+
+
+def test_exact_imperfect_information_certificate_snapshot_for_multi_suit_belief_position() -> None:
+    table = {
+        s: SuitRun()
+        for s in Suit
+    } | {
+        Suit.HEARTS: SuitRun(low=6, high=8),
+        Suit.CLUBS: SuitRun(low=7, high=7),
+    }
+    state = GameState(
+        table=table,
+        hand_counts=(4, 2, 2, 2),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        player=0,
+        hand=hand("5H 9H 6C 8C"),
+        deck=hand("4H 5H 6H 7H 8H 9H 10H 6C 7C 8C 7D 7S AC AD"),
+    )
+
+    result = recommend_move_exact_imperfect_information(state, knowledge)
+    assert result is not None
+    certificate = format_exact_imperfect_information_certificate(state, knowledge, result)
+
+    assert certificate == "\n".join(
+        [
+            "Exact imperfect-information certificate",
+            "policy: exact_hidden_deal_expectation_with_full_information_rational_continuation",
+            "continuation_model: opponents play full-information rationally from each materialized hidden deal",
+            "solver_player: P0",
+            "current_player: P0",
+            "solver_hand: [6C, 8C, 5H, 9H]",
+            "hand_counts: (4, 2, 2, 2)",
+            "legal_moves: [6C, 8C, 5H, 9H]",
+            "hidden_deals: 90",
+            "exhaustive: True",
+            "best_moves: [6C, 8C]",
+            "chosen_move: 6C",
+            "search: states=3072, cache_hits=948, terminals=216, deadlocks=0",
+            "move_expected_values:",
+            "  * 6C: EV=0.667, vector=(P0=0.667, P1=0.067, P2=0.133, P3=0.133), outcomes=(P0=60, P1=6, P2=12, P3=12, neutral=0), deals=90, exhaustive=True, se=0.000",
+            "    8C: EV=0.667, vector=(P0=0.667, P1=0.067, P2=0.133, P3=0.133), outcomes=(P0=60, P1=6, P2=12, P3=12, neutral=0), deals=90, exhaustive=True, se=0.000",
+            "    5H: EV=0.400, vector=(P0=0.400, P1=0.200, P2=0.200, P3=0.200), outcomes=(P0=36, P1=18, P2=18, P3=18, neutral=0), deals=90, exhaustive=True, se=0.000",
+            "    9H: EV=0.400, vector=(P0=0.400, P1=0.200, P2=0.200, P3=0.200), outcomes=(P0=36, P1=18, P2=18, P3=18, neutral=0), deals=90, exhaustive=True, se=0.000",
+        ]
+    )
+
+
+def test_full_information_from_hands_derives_trailing_public_pass_count() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        current_player=3,
+        history=(
+            MoveEvent(0, Card(Suit.HEARTS, 7)),
+            MoveEvent(1, None),
+            MoveEvent(2, None),
+        ),
+    )
+
+    full_state = FullInformationState.from_hands(
+        {
+            0: hand("6H"),
+            1: hand("AC"),
+            2: hand("AD"),
+            3: hand("AS"),
+        },
+        state,
+    )
+
+    assert full_state.consecutive_passes == 2
+
+
+def test_exact_imperfect_information_reuses_same_hidden_deal_set_for_all_candidate_moves() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(3, 2, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        player=0,
+        hand=hand("5H 6H 8H"),
+        deck=hand("5H 6H 7H 8H 9H 7C AC AD"),
+    )
+
+    result = recommend_move_exact_imperfect_information(state, knowledge, max_deals=5)
+
+    assert result is not None
+    assert not result.exhaustive
+    assert {score.hidden_deals for score in result.move_scores} == {5}
+    assert all(not score.exhaustive for score in result.move_scores)
+    assert all(math.isnan(score.value_standard_error) for score in result.move_scores)
+
+
+def test_exact_imperfect_information_uses_vector_tie_breaker() -> None:
+    move = choose_expected_value_vector_move(
+        0,
+        {
+            Card(Suit.CLUBS, 6): (0.5, 0.5, 0.0, 0.0),
+            Card(Suit.CLUBS, 8): (0.5, 0.0, 0.5, 0.0),
+        },
+    )
+
+    assert move == Card(Suit.CLUBS, 8)
 
 
 def test_recommend_move_exact_imperfect_information_reports_non_exhaustive_limit() -> None:
@@ -859,3 +1283,35 @@ def test_lowest_legal_card_policy_rejects_forced_pass_state() -> None:
         assert "no legal moves" in str(error)
     else:
         raise AssertionError("expected fixed policy helper to reject forced-pass state")
+
+
+def test_proof_benchmark_tiers_include_harder_positions() -> None:
+    fast_positions = benchmark_positions()
+    all_positions = benchmark_positions(include_hard=True)
+
+    assert {name for name, _ in fast_positions} == FAST_BENCHMARKS
+    assert {name for name, _ in all_positions} == FAST_BENCHMARKS | HARD_BENCHMARKS
+
+
+def test_hard_proof_benchmark_reaches_thousand_state_scale() -> None:
+    state = dict(hard_benchmark_positions())["four_suit_5_cards_each"]
+
+    result = solve_full_information(state)
+
+    assert result.states_evaluated >= 1000
+    assert result.deadlock_states == 0
+
+
+def test_proof_eval_reports_engine_regret_against_exact_ev() -> None:
+    scenario = dict((scenario.name, scenario) for scenario in evaluation_scenarios())["multi_suit_belief_ev"]
+
+    evaluation = evaluate_scenario(scenario, include_monte_carlo=False)
+
+    assert evaluation.exhaustive
+    assert evaluation.hidden_deals == 90
+    assert evaluation.exact_choice in evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand)
+    assert evaluation.heuristic_choice in evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand)
+    assert evaluation.heuristic_regret >= 0.0
+    assert {move.card for move in evaluation.move_evaluations} == set(
+        evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand)
+    )

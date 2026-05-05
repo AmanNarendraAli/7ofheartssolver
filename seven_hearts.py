@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from math import isnan, nan, sqrt
+from time import perf_counter
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping
 
@@ -191,6 +192,15 @@ def table_mapping(table_key: tuple[SuitRun, SuitRun, SuitRun, SuitRun]) -> dict[
     return {suit: table_key[index] for index, suit in enumerate(SUIT_ORDER)}
 
 
+def trailing_pass_count(history: Iterable[MoveEvent]) -> int:
+    count = 0
+    for event in reversed(tuple(history)):
+        if not event.is_pass:
+            break
+        count += 1
+    return count
+
+
 def card_sort_key(card: Card) -> tuple[str, int]:
     return (card.suit.value, card.rank)
 
@@ -232,7 +242,7 @@ class FullInformationState:
         cls,
         hands: Mapping[int, Iterable[Card]],
         state: GameState | None = None,
-        consecutive_passes: int = 0,
+        consecutive_passes: int | None = None,
         winner: int | None = None,
     ) -> "FullInformationState":
         state = state or GameState()
@@ -241,7 +251,7 @@ class FullInformationState:
             table=canonical_table(state.table),
             current_player=state.current_player,
             winner=winner if winner is not None else first_empty_player(hands),
-            consecutive_passes=consecutive_passes,
+            consecutive_passes=trailing_pass_count(state.history) if consecutive_passes is None else consecutive_passes,
         )
 
     def table_dict(self) -> dict[Suit, SuitRun]:
@@ -324,6 +334,24 @@ class ExactSolverResult:
     exhaustive: bool = True
 
 
+@dataclass(frozen=True)
+class ExactSearchBenchmark:
+    name: str
+    value: tuple[float, float, float, float]
+    chosen_move: Card | None
+    states_evaluated: int
+    cache_hits: int
+    terminal_states: int
+    deadlock_states: int
+    elapsed_seconds: float
+
+    @property
+    def states_per_second(self) -> float:
+        if self.elapsed_seconds == 0.0:
+            return float("inf")
+        return self.states_evaluated / self.elapsed_seconds
+
+
 def terminal_value(winner: int) -> tuple[float, float, float, float]:
     values = [0.0, 0.0, 0.0, 0.0]
     values[winner] = 1.0
@@ -370,6 +398,22 @@ def solve_full_information(state: FullInformationState) -> ExactSolverResult:
     )
 
 
+def benchmark_full_information_search(name: str, state: FullInformationState) -> ExactSearchBenchmark:
+    started = perf_counter()
+    result = solve_full_information(state)
+    elapsed = perf_counter() - started
+    return ExactSearchBenchmark(
+        name=name,
+        value=result.value,
+        chosen_move=result.chosen_move,
+        states_evaluated=result.states_evaluated,
+        cache_hits=result.cache_hits,
+        terminal_states=result.terminal_states,
+        deadlock_states=result.deadlock_states,
+        elapsed_seconds=elapsed,
+    )
+
+
 def solve_full_information_value(
     current: FullInformationState,
     cache: dict[FullInformationState, tuple[float, float, float, float]],
@@ -389,13 +433,15 @@ def solve_full_information_value(
 
     legal = current.legal_moves()
     if not legal:
-        if current.consecutive_passes >= 4:
+        canonical = canonicalize_forced_pass_chain(current)
+        if canonical != current:
+            value = solve_full_information_value(canonical, cache, stats)
+            cache[current] = value
+            return value
+        if canonical.consecutive_passes >= 4:
             stats["deadlock_states"] += 1
             cache[current] = NEUTRAL_VALUE
             return NEUTRAL_VALUE
-        value = solve_full_information_value(current.after_action(None), cache, stats)
-        cache[current] = value
-        return value
 
     child_values = {
         card: solve_full_information_value(current.after_action(card), cache, stats)
@@ -435,13 +481,15 @@ def solve_full_information_against_policy(
 
         legal = current.legal_moves()
         if not legal:
-            if current.consecutive_passes >= 4:
+            canonical = canonicalize_forced_pass_chain(current)
+            if canonical != current:
+                value = solve_policy_value(canonical)
+                cache[current] = value
+                return value
+            if canonical.consecutive_passes >= 4:
                 stats["deadlock_states"] += 1
                 cache[current] = NEUTRAL_VALUE
                 return NEUTRAL_VALUE
-            value = solve_policy_value(current.after_action(None))
-            cache[current] = value
-            return value
 
         chosen = policy(current)
         if chosen not in legal:
@@ -481,6 +529,13 @@ def solve_full_information_against_policy(
     )
 
 
+def canonicalize_forced_pass_chain(state: FullInformationState) -> FullInformationState:
+    current = state
+    while current.winner is None and not current.legal_moves() and current.consecutive_passes < 4:
+        current = current.after_action(None)
+    return current
+
+
 def lowest_legal_card_policy(state: FullInformationState) -> Card:
     legal = state.legal_moves()
     if not legal:
@@ -516,6 +571,13 @@ def choose_expected_value_move(move_values: Mapping[Card, float]) -> Card:
     best = max(move_values.values())
     tied = [card for card, value in move_values.items() if value == best]
     return sorted(tied)[0]
+
+
+def choose_expected_value_vector_move(
+    player: int,
+    move_values: Mapping[Card, tuple[float, float, float, float]],
+) -> Card:
+    return choose_rational_move(player, move_values)
 
 
 def format_value(value: tuple[float, float, float, float]) -> str:
@@ -555,9 +617,11 @@ def format_exact_solver_certificate(
 class PlayerKnowledge:
     player: int
     hand: frozenset[Card]
+    deck: frozenset[Card] | None = None
 
     def unseen_cards(self, state: GameState) -> set[Card]:
-        return full_deck() - set(self.hand) - state.played_cards()
+        deck = set(self.deck) if self.deck is not None else full_deck()
+        return deck - set(self.hand) - state.played_cards()
 
 
 @dataclass(frozen=True)
@@ -579,8 +643,11 @@ class HiddenDealEnumeration:
 class ExactImperfectInformationMoveScore:
     card: Card
     expected_value: float
+    expected_value_vector: tuple[float, float, float, float]
     hidden_deals: int
     exhaustive: bool
+    outcome_counts: tuple[int, int, int, int] = (0, 0, 0, 0)
+    neutral_outcomes: int = 0
     value_standard_error: float = 0.0
 
 
@@ -591,7 +658,12 @@ class ExactImperfectInformationResult:
     move_scores: tuple[ExactImperfectInformationMoveScore, ...]
     hidden_deals: int
     exhaustive: bool
+    states_evaluated: int = 0
+    cache_hits: int = 0
+    terminal_states: int = 0
+    deadlock_states: int = 0
     policy_name: str = "exact_hidden_deal_expectation_with_full_information_rational_continuation"
+    continuation_model: str = "opponents play full-information rationally from each materialized hidden deal"
 
 
 @dataclass(frozen=True)
@@ -981,6 +1053,7 @@ def evaluate_move_exact_imperfect_information_from_deals(
         return ExactImperfectInformationMoveScore(
             card=card,
             expected_value=float("-inf"),
+            expected_value_vector=(float("-inf"), float("-inf"), float("-inf"), float("-inf")),
             hidden_deals=0,
             exhaustive=enumeration.exhaustive,
         )
@@ -992,20 +1065,39 @@ def evaluate_move_exact_imperfect_information_from_deals(
         "terminal_states": 0,
         "deadlock_states": 0,
     }
-    values: list[float] = []
+    values: list[tuple[float, float, float, float]] = []
+    outcome_counts = [0, 0, 0, 0]
+    neutral_outcomes = 0
+    public_legal_moves = tuple(state.legal_moves(knowledge.hand))
     for hidden_deal in enumeration.deals:
         hands = complete_hands(knowledge, hidden_deal)
         full_state = FullInformationState.from_hands(hands, state)
+        if full_state.legal_moves() != public_legal_moves:
+            raise ValueError(
+                "materialized hidden deal changed the solver's legal move set: "
+                f"public={labels(public_legal_moves)}, materialized={labels(full_state.legal_moves())}"
+            )
         child_state = full_state.after_action(card)
         value = solve_full_information_value(child_state, exact_cache, exact_stats)
-        values.append(value[knowledge.player])
+        values.append(value)
+        winners = [player for player, player_value in enumerate(value) if player_value == 1.0]
+        if len(winners) == 1:
+            outcome_counts[winners[0]] += 1
+        else:
+            neutral_outcomes += 1
 
-    expected_value = sum(values) / len(values)
+    expected_value_vector = tuple(
+        sum(value[player] for value in values) / len(values)
+        for player in range(4)
+    )
     return ExactImperfectInformationMoveScore(
         card=card,
-        expected_value=expected_value,
+        expected_value=expected_value_vector[knowledge.player],
+        expected_value_vector=expected_value_vector,  # type: ignore[arg-type]
         hidden_deals=enumeration.deal_count,
         exhaustive=enumeration.exhaustive,
+        outcome_counts=tuple(outcome_counts),  # type: ignore[arg-type]
+        neutral_outcomes=neutral_outcomes,
         value_standard_error=0.0 if enumeration.exhaustive else nan,
     )
 
@@ -1040,17 +1132,20 @@ def recommend_move_exact_imperfect_information(
     )
     hidden_deals = scores[0].hidden_deals if scores else 0
     exhaustive = all(score.exhaustive for score in scores)
+    value_vectors = {score.card: score.expected_value_vector for score in scores}
     best_value = max(score.expected_value for score in scores)
     best_moves = tuple(score.card for score in scores if score.expected_value == best_value)
-    chosen_move = choose_expected_value_move(
-        {score.card: score.expected_value for score in scores}
-    ) if scores else None
+    chosen_move = choose_expected_value_vector_move(knowledge.player, value_vectors) if scores else None
     return ExactImperfectInformationResult(
         chosen_move=chosen_move,
         best_moves=best_moves,
         move_scores=scores,
         hidden_deals=hidden_deals,
         exhaustive=exhaustive,
+        states_evaluated=exact_stats["states_evaluated"],
+        cache_hits=exact_stats["cache_hits"],
+        terminal_states=exact_stats["terminal_states"],
+        deadlock_states=exact_stats["deadlock_states"],
     )
 
 
@@ -1062,13 +1157,21 @@ def format_exact_imperfect_information_certificate(
     lines = [
         "Exact imperfect-information certificate",
         f"policy: {result.policy_name}",
+        f"continuation_model: {result.continuation_model}",
         f"solver_player: P{knowledge.player}",
         f"current_player: P{state.current_player}",
+        f"solver_hand: {labels(knowledge.hand)}",
+        f"hand_counts: {state.hand_counts}",
         f"legal_moves: {labels(state.legal_moves(knowledge.hand))}",
         f"hidden_deals: {result.hidden_deals}",
         f"exhaustive: {result.exhaustive}",
         f"best_moves: {labels(result.best_moves)}",
         f"chosen_move: {result.chosen_move.label() if result.chosen_move else 'pass'}",
+        (
+            "search: "
+            f"states={result.states_evaluated}, cache_hits={result.cache_hits}, "
+            f"terminals={result.terminal_states}, deadlocks={result.deadlock_states}"
+        ),
         "move_expected_values:",
     ]
     for score in sorted(result.move_scores, key=lambda item: item.card):
@@ -1080,7 +1183,11 @@ def format_exact_imperfect_information_certificate(
             suffix = f", se={score.value_standard_error:.3f}"
         lines.append(
             f"  {marker} {score.card.label()}: EV={score.expected_value:.3f}, "
-            f"deals={score.hidden_deals}, exhaustive={score.exhaustive}{suffix}"
+            f"vector={format_value(score.expected_value_vector)}, "
+            f"outcomes=(P0={score.outcome_counts[0]}, P1={score.outcome_counts[1]}, "
+            f"P2={score.outcome_counts[2]}, P3={score.outcome_counts[3]}, "
+            f"neutral={score.neutral_outcomes}), deals={score.hidden_deals}, "
+            f"exhaustive={score.exhaustive}{suffix}"
         )
     return "\n".join(lines)
 
@@ -1462,7 +1569,7 @@ def hand_count_tuple(hands: Mapping[int, set[Card]]) -> tuple[int, int, int, int
 
 def first_empty_player(hands: Mapping[int, set[Card]]) -> int | None:
     for player in range(4):
-        if not hands[player]:
+        if not hands.get(player, set()):
             return player
     return None
 
