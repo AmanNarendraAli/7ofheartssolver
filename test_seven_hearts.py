@@ -5,6 +5,7 @@ from seven_hearts import (
     Card,
     FullInformationState,
     GameState,
+    FullGameAgent,
     MoveEvent,
     PlayerKnowledge,
     StrategyCandidate,
@@ -24,6 +25,7 @@ from seven_hearts import (
     evaluate_move_information_limited_monte_carlo,
     estimate_complete_game_metrics,
     estimate_strategy_self_play,
+    evaluate_duplicate_deal_seat_rotation,
     evaluate_move_monte_carlo,
     evaluate_move_exact_imperfect_information,
     format_exact_imperfect_information_certificate,
@@ -41,6 +43,7 @@ from seven_hearts import (
     recommend_move_exact_information_limited_policy,
     recommend_move_information_limited_monte_carlo,
     recommend_move_monte_carlo,
+    reduced_deck,
     rollout_information_limited,
     rollout_oracle,
     sample_hidden_deal,
@@ -53,6 +56,7 @@ from seven_hearts import (
     solve_full_information,
     solve_full_information_against_policy,
     simulate_complete_game,
+    simulate_full_game_to_completion,
     time_to_playable,
 )
 from proof_benchmark import FAST_BENCHMARKS, HARD_BENCHMARKS, benchmark_positions, hard_benchmark_positions
@@ -479,6 +483,21 @@ def test_recommend_move_monte_carlo_returns_legal_move() -> None:
     assert result.card in {Card(Suit.HEARTS, 6), Card(Suit.HEARTS, 8)}
 
 
+def test_recommend_move_monte_carlo_skips_forced_move_sampling() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(player=0, hand=hand("6H AS"))
+
+    result = recommend_move_monte_carlo(state, knowledge, samples_per_move=20, rng=random.Random(6))
+
+    assert result is not None
+    assert result.card == Card(Suit.HEARTS, 6)
+    assert result.samples == 0
+    assert result.policy_name == "oracle_greedy_full_information_forced_move"
+
+
 def test_information_limited_policy_uses_only_actor_hand_and_public_state() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -550,6 +569,32 @@ def test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_l
     assert result.card in state.legal_moves(knowledge.hand)
     assert result.samples == 4
     assert result.policy_name == "information_limited_greedy_heuristic"
+
+
+def test_recommend_move_information_limited_monte_carlo_skips_forced_move_sampling() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H AS"),
+        deck=frozenset(hand("6H AS 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=20,
+        max_turns=20,
+        rng=random.Random(12),
+    )
+
+    assert result is not None
+    assert result.card == Card(Suit.HEARTS, 6)
+    assert result.samples == 0
+    assert result.policy_name == "information_limited_greedy_heuristic_forced_move"
 
 
 def test_evaluate_move_information_limited_monte_carlo_supports_softmax_policy() -> None:
@@ -647,6 +692,23 @@ def test_deal_random_hands_deals_full_deck_once() -> None:
     assert len(all_cards) == 52
 
 
+def test_reduced_deck_is_centered_on_seven() -> None:
+    deck = reduced_deck(cards_per_suit=5)
+
+    assert len(deck) == 20
+    assert {card.rank for card in deck if card.suit == Suit.HEARTS} == {5, 6, 7, 8, 9}
+    assert Card(Suit.HEARTS, 7) in deck
+
+
+def test_deal_random_hands_supports_reduced_cards_per_suit() -> None:
+    hands = deal_random_hands(random.Random(7), cards_per_suit=5)
+    all_cards = set().union(*hands.values())
+
+    assert len(all_cards) == 20
+    assert all(len(hand_cards) == 5 for hand_cards in hands.values())
+    assert all_cards == reduced_deck(5)
+
+
 def test_deal_random_hands_is_seed_reproducible() -> None:
     hands = deal_random_hands(random.Random(7))
 
@@ -683,6 +745,140 @@ def test_estimate_complete_game_metrics_reports_rates() -> None:
     assert all(rate >= 0.0 for rate in estimate.win_rates)
     assert all(error >= 0.0 for error in estimate.win_rate_standard_errors)
     assert estimate.average_turns > 0.0
+
+
+def test_full_game_to_completion_reports_final_ranks_and_cards_left() -> None:
+    hands = deal_random_hands(random.Random(12))
+    agents = (
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+        FullGameAgent("Oracle", "oracle_greedy"),
+    )
+
+    result = simulate_full_game_to_completion(hands, agents, random.Random(13), max_turns=500)
+
+    assert result.winner in {0, 1, 2, 3}
+    assert sorted(result.ranks_by_seat) == [1, 2, 3, 4]
+    assert result.final_hand_counts[result.winner] == 0
+    assert sum(1 for count in result.final_hand_counts if count > 0) <= 1
+    assert not result.timed_out
+
+
+def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
+    agents = (
+        FullGameAgent("Ours", "heuristic"),
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+
+    evaluation = evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=2,
+        rng=random.Random(14),
+        max_turns=500,
+    )
+
+    assert evaluation.games == 8
+    assert evaluation.deals == 2
+    assert evaluation.rotations_per_deal == 4
+    assert {summary.agent_name for summary in evaluation.agent_summaries} == {
+        "Ours",
+        "Random",
+        "Greedy",
+        "Heuristic",
+    }
+    assert all(summary.seats_played == 8 for summary in evaluation.agent_summaries)
+    assert {advantage.baseline_agent for advantage in evaluation.paired_card_advantages} == {
+        "Random",
+        "Greedy",
+        "Heuristic",
+    }
+    assert all(advantage.comparisons == 8 for advantage in evaluation.paired_card_advantages)
+    assert evaluation.average_turns > 0.0
+
+
+def test_duplicate_deal_evaluation_reports_progress() -> None:
+    agents = (
+        FullGameAgent("Ours", "heuristic"),
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+    progress: list[tuple[int, int, int, int]] = []
+
+    evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=1,
+        rng=random.Random(15),
+        max_turns=500,
+        progress_callback=lambda completed, total, deal, rotation, result: progress.append(
+            (completed, total, deal, rotation)
+        ),
+    )
+
+    assert progress == [
+        (1, 4, 1, 1),
+        (2, 4, 1, 2),
+        (3, 4, 1, 3),
+        (4, 4, 1, 4),
+    ]
+
+
+def test_duplicate_deal_evaluation_records_deterministic_game_results() -> None:
+    agents = (
+        FullGameAgent("Ours", "heuristic"),
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+
+    first = evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=1,
+        rng=random.Random(17),
+        max_turns=500,
+        cards_per_suit=5,
+    )
+    second = evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=1,
+        rng=random.Random(17),
+        max_turns=500,
+        cards_per_suit=5,
+    )
+
+    assert len(first.game_results) == 4
+    assert [game.seed for game in first.game_results] == [game.seed for game in second.game_results]
+    assert [game.result for game in first.game_results] == [game.result for game in second.game_results]
+    assert [(game.deal_index, game.rotation_index) for game in first.game_results] == [
+        (1, 1),
+        (1, 2),
+        (1, 3),
+        (1, 4),
+    ]
+
+
+def test_duplicate_deal_evaluation_supports_reduced_decks() -> None:
+    agents = (
+        FullGameAgent("Ours", "information_limited_monte_carlo", samples_per_move=1, rollout_max_turns=20),
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+
+    evaluation = evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=1,
+        rng=random.Random(16),
+        max_turns=200,
+        cards_per_suit=5,
+    )
+
+    assert evaluation.games == 4
+    assert evaluation.timeout_rate == 0.0
+    assert all(summary.average_cards_left <= 5 for summary in evaluation.agent_summaries)
 
 
 def test_opponent_model_reports_impossible_known_counts() -> None:

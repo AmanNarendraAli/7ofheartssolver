@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import random
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from math import exp, isnan, nan, sqrt
 from time import perf_counter
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 
 class Suit(str, Enum):
@@ -89,8 +90,31 @@ def mask_to_cards(mask: int) -> tuple[Card, ...]:
     return tuple(cards)
 
 
+def maybe_only_card(mask: int) -> Card | None:
+    if mask and mask & (mask - 1) == 0:
+        return card_from_index(mask.bit_length() - 1)
+    return None
+
+
 def full_deck() -> set[Card]:
     return set(CARD_BY_INDEX)
+
+
+def reduced_deck(cards_per_suit: int) -> set[Card]:
+    if cards_per_suit < 1 or cards_per_suit > 13:
+        raise ValueError(f"cards_per_suit must be between 1 and 13, got {cards_per_suit}")
+
+    lower_span = (cards_per_suit - 1) // 2
+    low = 7 - lower_span
+    high = low + cards_per_suit - 1
+    if high > 13:
+        high = 13
+        low = high - cards_per_suit + 1
+    if low < 1:
+        low = 1
+        high = low + cards_per_suit - 1
+
+    return {Card(suit, rank) for suit in Suit for rank in range(low, high + 1)}
 
 
 @dataclass(frozen=True)
@@ -897,6 +921,66 @@ class StrategySelfPlayEstimate:
 
 
 @dataclass(frozen=True)
+class FullGameAgent:
+    name: str
+    policy: str
+    weights: StrategyWeights = DEFAULT_WEIGHTS
+    samples_per_move: int = 24
+    rollout_max_turns: int = 160
+    rollout_policy: str = "greedy"
+    rationality: float = 1.0
+
+
+@dataclass(frozen=True)
+class FullGameResult:
+    agent_names_by_seat: tuple[str, str, str, str]
+    winner: int | None
+    finish_order: tuple[int, ...]
+    ranks_by_seat: tuple[int, int, int, int]
+    final_hand_counts: tuple[int, int, int, int]
+    turns_played: int
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class AgentFullGameSummary:
+    agent_name: str
+    seats_played: int
+    win_rate: float
+    average_cards_left: float
+    average_rank: float
+
+
+@dataclass(frozen=True)
+class PairedCardAdvantage:
+    primary_agent: str
+    baseline_agent: str
+    comparisons: int
+    average_advantage: float
+    standard_error: float
+
+
+@dataclass(frozen=True)
+class DuplicateDealGameResult:
+    deal_index: int
+    rotation_index: int
+    seed: int
+    result: FullGameResult
+
+
+@dataclass(frozen=True)
+class DuplicateDealEvaluation:
+    games: int
+    deals: int
+    rotations_per_deal: int
+    agent_summaries: tuple[AgentFullGameSummary, ...]
+    paired_card_advantages: tuple[PairedCardAdvantage, ...]
+    average_turns: float
+    timeout_rate: float
+    game_results: tuple[DuplicateDealGameResult, ...] = ()
+
+
+@dataclass(frozen=True)
 class OpponentModel:
     possible_cards: dict[int, set[Card]]
     hand_counts: tuple[int | None, int | None, int | None, int | None] | None = None
@@ -1484,6 +1568,8 @@ def recommend_move_monte_carlo(
     legal = state.legal_moves(knowledge.hand)
     if not legal:
         return None
+    if len(legal) == 1:
+        return forced_move_monte_carlo_score(legal[0], "oracle_greedy_full_information_forced_move")
 
     rng = rng or random.Random()
     hidden_deals = sample_hidden_deals(state, knowledge, samples_per_move, rng)
@@ -1492,6 +1578,20 @@ def recommend_move_monte_carlo(
         for card in legal
     ]
     return max(results, key=lambda result: result.score)
+
+
+def forced_move_monte_carlo_score(card: Card, policy_name: str) -> MonteCarloMoveScore:
+    return MonteCarloMoveScore(
+        card=card,
+        score=0.0,
+        win_rate=0.0,
+        average_finish_margin=0.0,
+        samples=0,
+        average_turns=0.0,
+        timeout_rate=0.0,
+        win_rate_standard_error=0.0,
+        policy_name=policy_name,
+    )
 
 
 def evaluate_move_monte_carlo(
@@ -1605,9 +1705,13 @@ def recommend_move_information_limited_monte_carlo(
     legal = state.legal_moves(knowledge.hand)
     if not legal:
         return None
+    if len(legal) == 1:
+        policy_name = f"{information_limited_policy_name(policy, rationality)}_forced_move"
+        return forced_move_monte_carlo_score(legal[0], policy_name)
 
     rng = rng or random.Random()
     hidden_deals = sample_hidden_deals(state, knowledge, samples_per_move, rng)
+    policy_cache: InformationLimitedPolicyCache | None = {} if policy == "greedy" else None
     results = [
         evaluate_move_information_limited_monte_carlo_from_deals(
             state,
@@ -1619,6 +1723,7 @@ def recommend_move_information_limited_monte_carlo(
             policy,
             rationality,
             rng,
+            policy_cache,
         )
         for card in legal
     ]
@@ -1648,6 +1753,7 @@ def evaluate_move_information_limited_monte_carlo(
         policy,
         rationality,
         rng,
+        {} if policy == "greedy" else None,
     )
 
 
@@ -1661,6 +1767,7 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
     policy: str = "greedy",
     rationality: float = 1.0,
     rng: random.Random | None = None,
+    policy_cache: InformationLimitedPolicyCache | None = None,
 ) -> MonteCarloMoveScore:
     rng = rng or random.Random()
     wins = 0
@@ -1675,7 +1782,16 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
             continue
 
         next_state, next_hands = apply_known_play(state, hands, knowledge.player, card)
-        result = rollout_information_limited(next_state, next_hands, max_turns, weights, policy, rationality, rng)
+        result = rollout_information_limited(
+            next_state,
+            next_hands,
+            max_turns,
+            weights,
+            policy,
+            rationality,
+            rng,
+            policy_cache,
+        )
         completed_samples += 1
         if result.winner == knowledge.player:
             wins += 1
@@ -1726,6 +1842,7 @@ def rollout_information_limited(
     policy: str = "greedy",
     rationality: float = 1.0,
     rng: random.Random | None = None,
+    policy_cache: InformationLimitedPolicyCache | None = None,
 ) -> RolloutResult:
     rng = rng or random.Random()
     current_state = state_with_hand_counts(state, hands)
@@ -1753,6 +1870,7 @@ def rollout_information_limited(
             rationality,
             rng,
             deck,
+            policy_cache,
         )
         current_state, current_hands = apply_known_play(current_state, current_hands, player, card)
 
@@ -1768,16 +1886,40 @@ def choose_information_limited_move(
     rationality: float = 1.0,
     rng: random.Random | None = None,
     deck: frozenset[Card] | None = None,
+    cache: InformationLimitedPolicyCache | None = None,
 ) -> Card | None:
     hand_set = frozenset(hand)
-    legal = state.legal_moves(hand_set)
+    hand_mask = card_set_mask(hand_set)
+    legal_mask = hand_mask & state.public_legal_mask()
+    only_legal = maybe_only_card(legal_mask)
+    if only_legal is not None:
+        return only_legal
+    legal = list(mask_to_cards(legal_mask))
     if not legal:
         return None
+
+    cache_key = None
+    if cache is not None and policy == "greedy":
+        cache_key = information_limited_policy_cache_key(
+            state,
+            hand_mask,
+            player,
+            weights,
+            policy,
+            rationality,
+            deck,
+        )
+        cached = cache.get(cache_key)
+        if cached is not None or cache_key in cache:
+            return cached
 
     knowledge = PlayerKnowledge(player, hand_set, deck=deck)
     scores = tuple(score_move(state, knowledge, card, weights=weights) for card in legal)
     if policy == "greedy":
-        return max(scores, key=lambda scored: scored.score).card
+        choice = max(scores, key=lambda scored: scored.score).card
+        if cache is not None and cache_key is not None:
+            cache[cache_key] = choice
+        return choice
     if policy == "softmax":
         rng = rng or random.Random()
         return choose_softmax_move(scores, rationality, rng)
@@ -1814,6 +1956,47 @@ def information_limited_policy_name(policy: str, rationality: float) -> str:
     if policy == "softmax":
         return f"information_limited_softmax_heuristic_rationality_{rationality:g}"
     return f"information_limited_{policy}"
+
+
+InformationLimitedPolicyCacheKey = tuple[
+    tuple[tuple[int | None, int | None], ...],
+    tuple[int | None, int | None, int | None, int | None] | None,
+    int,
+    tuple[tuple[int, int], ...],
+    int,
+    int,
+    StrategyWeights,
+    str,
+    float,
+    int | None,
+]
+InformationLimitedPolicyCache = dict[InformationLimitedPolicyCacheKey, Card | None]
+
+
+def information_limited_policy_cache_key(
+    state: GameState,
+    hand_mask: int,
+    player: int,
+    weights: StrategyWeights,
+    policy: str,
+    rationality: float,
+    deck: frozenset[Card] | None,
+) -> InformationLimitedPolicyCacheKey:
+    table_key = tuple((run.low, run.high) for run in canonical_table(state.table))
+    history_key = tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history)
+    deck_mask = card_set_mask(deck) if deck is not None else None
+    return (
+        table_key,
+        state.hand_counts,
+        state.current_player,
+        history_key,
+        hand_mask,
+        player,
+        weights,
+        policy,
+        rationality,
+        deck_mask,
+    )
 
 
 def weights_for_player(
@@ -2002,17 +2185,385 @@ def finish_margin(hand_counts: tuple[int, int, int, int], player: int) -> float:
     return min(opponents) - hand_counts[player]
 
 
-def deal_random_hands(rng: random.Random | None = None) -> dict[int, set[Card]]:
+def deal_random_hands(
+    rng: random.Random | None = None,
+    cards_per_suit: int = 13,
+) -> dict[int, set[Card]]:
     rng = rng or random.Random()
-    deck = sorted(full_deck(), key=lambda card: (card.suit.value, card.rank))
+    deck = sorted(reduced_deck(cards_per_suit), key=lambda card: (card.suit.value, card.rank))
     rng.shuffle(deck)
-    return {player: set(deck[player * 13 : (player + 1) * 13]) for player in range(4)}
+    cards_per_player = len(deck) // 4
+    return {player: set(deck[player * cards_per_player : (player + 1) * cards_per_player]) for player in range(4)}
 
 
 def initial_state_for_hands(hands: Mapping[int, set[Card]]) -> GameState:
     seven_hearts = Card(Suit.HEARTS, 7)
     starting_player = next(player for player, hand in hands.items() if seven_hearts in hand)
     return GameState(hand_counts=hand_count_tuple(hands), current_player=starting_player)
+
+
+def replace_current_player(state: GameState, current_player: int) -> GameState:
+    return GameState(
+        table=state.table,
+        hand_counts=state.hand_counts,
+        current_player=current_player,
+        history=state.history,
+    )
+
+
+def next_active_player(start_player: int, hands: Mapping[int, set[Card]]) -> int | None:
+    for offset in range(4):
+        player = (start_player + offset) % 4
+        if hands[player]:
+            return player
+    return None
+
+
+def unfinished_players(hands: Mapping[int, set[Card]]) -> tuple[int, ...]:
+    return tuple(player for player in range(4) if hands[player])
+
+
+def default_seat_rotations() -> tuple[tuple[int, int, int, int], ...]:
+    return (
+        (0, 1, 2, 3),
+        (3, 0, 1, 2),
+        (2, 3, 0, 1),
+        (1, 2, 3, 0),
+    )
+
+
+def choose_full_game_agent_move(
+    state: GameState,
+    hands: Mapping[int, set[Card]],
+    player: int,
+    agent: FullGameAgent,
+    rng: random.Random,
+    deck: frozenset[Card] | None = None,
+) -> Card | None:
+    legal = state.legal_moves(hands[player])
+    if not legal:
+        return None
+
+    if agent.policy == "random":
+        return rng.choice(legal)
+    if agent.policy == "greedy_furthest_from_seven":
+        return max(legal, key=lambda card: (abs(card.rank - 7), -card_index(card)))
+    if agent.policy == "heuristic":
+        knowledge = PlayerKnowledge(player, frozenset(hands[player]), deck=deck)
+        model = build_opponent_model(state, knowledge)
+        return max(
+            legal,
+            key=lambda card: score_move(state, knowledge, card, model=model, weights=agent.weights).score,
+        )
+    if agent.policy == "information_limited_monte_carlo":
+        knowledge = PlayerKnowledge(player, frozenset(hands[player]), deck=deck)
+        recommendation = recommend_move_information_limited_monte_carlo(
+            state,
+            knowledge,
+            samples_per_move=agent.samples_per_move,
+            max_turns=agent.rollout_max_turns,
+            rng=rng,
+            weights=agent.weights,
+            policy=agent.rollout_policy,
+            rationality=agent.rationality,
+        )
+        return recommendation.card if recommendation is not None else None
+    if agent.policy == "oracle_greedy":
+        return choose_oracle_move(state, hands, player, agent.weights)
+
+    raise ValueError(f"unknown full-game agent policy: {agent.policy}")
+
+
+def simulate_full_game_to_completion(
+    hands: Mapping[int, set[Card]],
+    agents_by_seat: Sequence[FullGameAgent],
+    rng: random.Random | None = None,
+    max_turns: int = 1000,
+    deck: frozenset[Card] | None = None,
+) -> FullGameResult:
+    if len(agents_by_seat) != 4:
+        raise ValueError("full-game simulation requires exactly four agents")
+
+    rng = rng or random.Random()
+    current_hands = {player: set(hand) for player, hand in hands.items()}
+    deck = deck or frozenset(card for hand in current_hands.values() for card in hand)
+    state = initial_state_for_hands(current_hands)
+    finish_order: list[int] = []
+
+    for turns_played in range(max_turns + 1):
+        active = unfinished_players(current_hands)
+        if len(active) <= 1:
+            if active:
+                finish_order.append(active[0])
+            return finalized_full_game_result(
+                agents_by_seat,
+                finish_order,
+                hand_count_tuple(current_hands),
+                turns_played,
+                timed_out=False,
+            )
+        if turns_played == max_turns:
+            break
+
+        player = next_active_player(state.current_player, current_hands)
+        if player is None:
+            break
+        if player != state.current_player:
+            state = replace_current_player(state, player)
+
+        card = choose_full_game_agent_move(state, current_hands, player, agents_by_seat[player], rng, deck)
+        state, current_hands = apply_known_play(state, current_hands, player, card)
+        if not current_hands[player] and player not in finish_order:
+            finish_order.append(player)
+
+        next_player = next_active_player(state.current_player, current_hands)
+        if next_player is not None and next_player != state.current_player:
+            state = replace_current_player(state, next_player)
+
+    counts = hand_count_tuple(current_hands)
+    timed_out_order = finish_order + sorted(
+        (player for player in range(4) if player not in finish_order),
+        key=lambda player: (counts[player], player),
+    )
+    return finalized_full_game_result(
+        agents_by_seat,
+        timed_out_order,
+        counts,
+        max_turns,
+        timed_out=True,
+    )
+
+
+def finalized_full_game_result(
+    agents_by_seat: Sequence[FullGameAgent],
+    finish_order: Sequence[int],
+    final_hand_counts: tuple[int, int, int, int],
+    turns_played: int,
+    timed_out: bool,
+) -> FullGameResult:
+    ranks = [4, 4, 4, 4]
+    seen: set[int] = set()
+    normalized_order: list[int] = []
+    for player in finish_order:
+        if player not in seen:
+            normalized_order.append(player)
+            seen.add(player)
+    for player in range(4):
+        if player not in seen:
+            normalized_order.append(player)
+
+    for rank, player in enumerate(normalized_order, start=1):
+        ranks[player] = rank
+
+    return FullGameResult(
+        agent_names_by_seat=tuple(agent.name for agent in agents_by_seat),  # type: ignore[arg-type]
+        winner=normalized_order[0] if normalized_order else None,
+        finish_order=tuple(normalized_order),
+        ranks_by_seat=tuple(ranks),  # type: ignore[arg-type]
+        final_hand_counts=final_hand_counts,
+        turns_played=turns_played,
+        timed_out=timed_out,
+    )
+
+
+DuplicateDealGameJob = tuple[
+    int,
+    int,
+    int,
+    dict[int, set[Card]],
+    tuple[int, int, int, int],
+    tuple[FullGameAgent, ...],
+    int,
+    frozenset[Card],
+]
+
+
+def make_duplicate_deal_game_jobs(
+    agents: Sequence[FullGameAgent],
+    dealt_hands: Sequence[dict[int, set[Card]]],
+    rotations: Sequence[Sequence[int]],
+    rng: random.Random,
+    max_turns: int,
+    deck: frozenset[Card],
+) -> tuple[DuplicateDealGameJob, ...]:
+    jobs: list[DuplicateDealGameJob] = []
+    for deal_index, deal in enumerate(dealt_hands, start=1):
+        for rotation_index, rotation in enumerate(rotations, start=1):
+            jobs.append(
+                (
+                    deal_index,
+                    rotation_index,
+                    rng.getrandbits(63),
+                    deal,
+                    tuple(rotation),  # type: ignore[arg-type]
+                    tuple(agents),
+                    max_turns,
+                    deck,
+                )
+            )
+    return tuple(jobs)
+
+
+def simulate_duplicate_deal_game_job(job: DuplicateDealGameJob) -> DuplicateDealGameResult:
+    deal_index, rotation_index, seed, deal, rotation, agents, max_turns, deck = job
+    agents_by_seat = tuple(agents[index] for index in rotation)
+    result = simulate_full_game_to_completion(
+        deal,
+        agents_by_seat,
+        random.Random(seed),
+        max_turns=max_turns,
+        deck=deck,
+    )
+    return DuplicateDealGameResult(deal_index, rotation_index, seed, result)
+
+
+def evaluate_duplicate_deal_seat_rotation(
+    agents: Sequence[FullGameAgent],
+    deals: int,
+    rng: random.Random | None = None,
+    max_turns: int = 1000,
+    rotations: Sequence[Sequence[int]] | None = None,
+    primary_agent_name: str = "Ours",
+    progress_callback: Callable[[int, int, int, int, FullGameResult], None] | None = None,
+    cards_per_suit: int = 13,
+    workers: int = 1,
+) -> DuplicateDealEvaluation:
+    if len(agents) != 4:
+        raise ValueError("duplicate-deal evaluation requires exactly four agents")
+
+    rng = rng or random.Random()
+    rotations = tuple(tuple(rotation) for rotation in (rotations or default_seat_rotations()))
+    deck = frozenset(reduced_deck(cards_per_suit))
+    dealt_hands = [deal_random_hands(rng, cards_per_suit=cards_per_suit) for _ in range(deals)]
+    jobs = make_duplicate_deal_game_jobs(agents, dealt_hands, rotations, rng, max_turns, deck)
+    game_results: list[DuplicateDealGameResult] = []
+
+    total_games = len(jobs)
+    completed_games = 0
+    if workers <= 1:
+        for job in jobs:
+            game_result = simulate_duplicate_deal_game_job(job)
+            game_results.append(game_result)
+            completed_games += 1
+            if progress_callback is not None:
+                progress_callback(
+                    completed_games,
+                    total_games,
+                    game_result.deal_index,
+                    game_result.rotation_index,
+                    game_result.result,
+                )
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(simulate_duplicate_deal_game_job, job) for job in jobs]
+            for future in as_completed(futures):
+                game_result = future.result()
+                game_results.append(game_result)
+                completed_games += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        completed_games,
+                        total_games,
+                        game_result.deal_index,
+                        game_result.rotation_index,
+                        game_result.result,
+                    )
+
+    game_results.sort(key=lambda game_result: (game_result.deal_index, game_result.rotation_index))
+
+    return summarize_duplicate_deal_results(
+        [game_result.result for game_result in game_results],
+        deals=deals,
+        rotations_per_deal=len(rotations),
+        primary_agent_name=primary_agent_name,
+        game_results=game_results,
+    )
+
+
+def summarize_duplicate_deal_results(
+    results: Sequence[FullGameResult],
+    deals: int,
+    rotations_per_deal: int,
+    primary_agent_name: str = "Ours",
+    game_results: Sequence[DuplicateDealGameResult] = (),
+) -> DuplicateDealEvaluation:
+    totals: dict[str, dict[str, float]] = {}
+    paired: dict[str, list[float]] = {}
+    turns_total = 0
+    timeouts = 0
+
+    for result in results:
+        turns_total += result.turns_played
+        if result.timed_out:
+            timeouts += 1
+
+        primary_cards_left: int | None = None
+        for seat, agent_name in enumerate(result.agent_names_by_seat):
+            bucket = totals.setdefault(
+                agent_name,
+                {"seats": 0.0, "wins": 0.0, "cards_left": 0.0, "rank": 0.0},
+            )
+            bucket["seats"] += 1.0
+            bucket["wins"] += 1.0 if result.winner == seat else 0.0
+            bucket["cards_left"] += result.final_hand_counts[seat]
+            bucket["rank"] += result.ranks_by_seat[seat]
+            if agent_name == primary_agent_name:
+                primary_cards_left = result.final_hand_counts[seat]
+
+        if primary_cards_left is None:
+            continue
+        for seat, agent_name in enumerate(result.agent_names_by_seat):
+            if agent_name == primary_agent_name:
+                continue
+            paired.setdefault(agent_name, []).append(result.final_hand_counts[seat] - primary_cards_left)
+
+    summaries: list[AgentFullGameSummary] = []
+    for agent_name, bucket in sorted(totals.items()):
+        seats = int(bucket["seats"])
+        if seats == 0:
+            continue
+        summaries.append(
+            AgentFullGameSummary(
+                agent_name=agent_name,
+                seats_played=seats,
+                win_rate=bucket["wins"] / seats,
+                average_cards_left=bucket["cards_left"] / seats,
+                average_rank=bucket["rank"] / seats,
+            )
+        )
+
+    advantages: list[PairedCardAdvantage] = []
+    for baseline, differences in sorted(paired.items()):
+        count = len(differences)
+        if count == 0:
+            continue
+        average = sum(differences) / count
+        if count > 1:
+            variance = sum((difference - average) ** 2 for difference in differences) / (count - 1)
+            standard_error = sqrt(variance / count)
+        else:
+            standard_error = 0.0
+        advantages.append(
+            PairedCardAdvantage(
+                primary_agent=primary_agent_name,
+                baseline_agent=baseline,
+                comparisons=count,
+                average_advantage=average,
+                standard_error=standard_error,
+            )
+        )
+
+    games = len(results)
+    return DuplicateDealEvaluation(
+        games=games,
+        deals=deals,
+        rotations_per_deal=rotations_per_deal,
+        agent_summaries=tuple(summaries),
+        paired_card_advantages=tuple(advantages),
+        average_turns=turns_total / games if games else 0.0,
+        timeout_rate=timeouts / games if games else 0.0,
+        game_results=tuple(game_results),
+    )
 
 
 def simulate_complete_game(

@@ -101,6 +101,23 @@ Implemented:
 - exact imperfect-information certificate snapshot regression for a multi-suit
   reduced belief position with four candidate moves and 90 hidden deals
 - `proof_demo.py` includes the multi-suit exact EV certificate
+- full-game-to-completion simulation that keeps playing after first-out until
+  only one player remains with cards, reporting final ranks and cards-left
+  outcomes
+- duplicate-deal, cyclic seat-rotated full-game evaluation with Random,
+  GreedyFurthestFromSeven, Heuristic, and belief-state sampled EV agents
+- paired card advantage summaries and CSV reports through `full_game_eval.py`
+- `full_game_eval.py` progress reporting through `--progress-every`, plus
+  `--fast` mode that uses heuristic `Ours` for quick harness checks without
+  Monte Carlo-in-the-loop cost
+- deterministic per-game seeds and `--workers` multiprocessing for independent
+  duplicate-deal rotation games, with results sorted back into deal/rotation
+  order for stable serial/parallel reports
+- detailed per-rotation `games.csv` report output with seeds, seat agents,
+  winners, ranks, cards left, turns, and timeout flags
+- reduced-deck full-game evaluation through `--cards-per-suit`, using a rank
+  window centered on 7, so `--cards-per-suit 5` runs ranks 5 through 9 in each
+  suit while preserving the normal table/turn rules
 - `proof_benchmark.py` now has an opt-in hard tier with thousand-state reduced
   exact-search positions; after the bitmask/cache-key pass, the current
   throughput suggests a 100k-state tier is a realistic next measurement target
@@ -144,7 +161,7 @@ Current verification:
 
 ```text
 py run_tests.py
-82 tests passed
+88 tests passed
 
 py proof_demo.py
 
@@ -154,7 +171,15 @@ py proof_benchmark.py --include-hard
 
 py proof_eval.py
 
-py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py demo.py simulator.py
+py full_game_eval.py --deals 1 --samples-per-move 2 --rollout-max-turns 40
+
+py full_game_eval.py --deals 2 --fast --progress-every 2 --max-turns 500
+
+py full_game_eval.py --deals 2 --cards-per-suit 5 --samples-per-move 4 --rollout-max-turns 40 --progress-every 2 --max-turns 200
+
+py full_game_eval.py --deals 8 --cards-per-suit 8 --samples-per-move 4 --rollout-max-turns 80 --workers 4 --progress-every 4
+
+py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py full_game_eval.py demo.py simulator.py
 ```
 
 Important current limitations:
@@ -219,7 +244,7 @@ Highest-priority solver/proof work left:
 7. Tune and validate the practical sampled policies against the exact reduced
    proof scenarios, especially the current multi-suit case where Monte Carlo
    can pick a regretful move at the default sample count.
-8. Build duplicate-deal, seat-rotated evaluation for full games, using average
+8. Scale duplicate-deal, seat-rotated full-game evaluation runs, using average
    cards left and paired card advantage as the primary practical metrics.
 
 ## Formal Model
@@ -1338,6 +1363,47 @@ Near-term practical-simulation optimizations:
   symbolic search and deal sampling are CPU/RAM-bound, while a 1660 Ti 6GB
   becomes useful mainly for later neural approximators or GPU-batched rollouts
 
+Clean FullMC evaluation optimization plan:
+
+The current evaluation question is whether the belief-state Monte Carlo agent
+adds marginal value over the one-ply heuristic. Efficiency work for that
+experiment must not change the decision policy being evaluated. The clean
+`FullMC` agent should run Monte Carlo on every meaningful decision and skip only
+non-decisions: forced passes, single legal moves, and immediate winning moves.
+
+Phase 1 focuses on using compute better without changing choices:
+
+- implemented: multiprocessing across independent duplicate-deal rotation games
+  through `full_game_eval.py --workers`
+- implemented: deterministic per-game seeds, so serial and parallel runs use
+  the same random stream per rotation game
+- preserved: fixed sample counts and fixed rollout limits for every meaningful
+  `FullMC` decision
+- implemented: progress reporting plus complete summary/detail CSV outputs,
+  including `games.csv` for per-rotation auditability
+- supported: reduced-deck tiers, such as `--cards-per-suit 8`, as explicitly
+  labeled clean evaluation tiers before scaling to full-deck games
+
+Phase 2 keeps the same `FullMC` decision semantics while reducing inner-loop
+cost:
+
+- profile reduced-deck Monte Carlo runs before rewriting internals
+- cache hidden-deal sampler construction per decision state
+- implemented: cache deterministic greedy information-limited rollout policy
+  choices by public state, actor hand, hand counts, deck, and weight/policy
+  settings inside each Monte Carlo decision
+- reduce repeated `GameState`, `PlayerKnowledge`, opponent-model, and set-copy
+  churn inside rollouts
+- extend bitmask hand/table updates deeper into information-limited rollouts
+- optionally parallelize hidden-deal samples within a decision only after
+  game-level multiprocessing is measured
+
+Potential Phase 3, for a later product agent, is selective/adaptive Monte Carlo:
+use heuristic gates, high-impact triggers, adaptive sample budgets, and
+fallbacks to spend rollout compute only where it is useful. This is not part of
+the clean `FullMC` versus `Heuristic` evaluation because it changes the policy
+being compared.
+
 ## Suggested Implementation Sequence
 
 Completed foundation:
@@ -1602,14 +1668,14 @@ Implemented now:
 - legacy greedy full-information oracle rollout with one-ply response penalty
 - proof-position reports comparing practical engines against exact
   full-information-continuation oracle values
+- full-game evaluator that continues after first-out to final ranks/cards-left
+  outcomes
+- duplicate-deal, cyclic seat-rotated benchmark harness
+- paired card advantage tables with standard errors
+- `GreedyFurthestFromSeven` full-game baseline
 
 Not implemented yet:
 
-- full-game evaluator that continues play after first-out to produce true ranks
-  and final cards-left outcomes
-- duplicate-deal, seat-rotated benchmark harness
-- paired card advantage tables and paired confidence intervals
-- `GreedyFurthestFromSeven` full-game baseline
 - perfect-information counterpart oracle for oracle-gap evaluation
 - true reduced-deck imperfect-information optimal solver with explicit
   information sets and belief updates
@@ -1638,10 +1704,12 @@ Rules engine
         -> exact information-limited EV on reduced belief states
           -> exact full-information and hidden-deal oracle validation cases
             -> true reduced-deck imperfect-information optimal solver if needed
-              -> heuristic policy tuned and validated against exact/sampled evidence
+              -> EV agent tuned and validated against exact/sampled evidence
 ```
 
-The heuristic solver remains central because exact play may be too expensive for
-normal interactive use. It should serve as the default information-limited
-policy inside sampled continuations, while the proof layer gives it a source of
-truth to learn from, regress against, and explain where approximation begins.
+The belief-state sampled EV agent is the central practical solver. The heuristic
+policy remains important because it is cheap, inspectable, and useful as a
+default information-limited continuation policy, a baseline, and a fallback when
+EV rollout is too expensive. The proof layer gives the EV agent and its
+continuation policies exact/reduced-deck targets to validate against and helps
+explain where approximation begins.

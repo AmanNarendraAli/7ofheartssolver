@@ -467,11 +467,27 @@ Current implementation status:
 
 - Implemented: belief sampling, information-limited rollout, information-limited
   Monte Carlo recommendation, exact reduced-state EV against the deterministic
-  information-limited greedy policy, and the legacy greedy full-information
+  information-limited greedy policy, the legacy greedy full-information oracle,
+  full-game cards-left/rank evaluation, duplicate-deal cyclic seat rotation,
+  paired card advantage summaries with standard errors, and
+  `GreedyFurthestFromSeven` as a full-game baseline. `full_game_eval.py` also
+  supports progress reporting, deterministic per-game seeds, `--workers`
+  multiprocessing across independent rotation games, detailed `games.csv`
+  output, and a fast heuristic-`Ours` mode for cheap evaluator smoke tests.
+  Reduced-deck full-game evaluation is available through `--cards-per-suit`;
+  for example, `--cards-per-suit 5` uses ranks 5 through 9 in every suit.
+- Not yet implemented: large 1,000-deal practical benchmark runs, 95% paired
+  confidence intervals in the report, and the perfect-information counterpart
   oracle.
-- Not yet implemented: full-game cards-left evaluator, seat-rotated duplicate
-  deals, paired card advantage confidence intervals, `GreedyFurthestFromSeven`
-  as a full-game baseline, and the perfect-information counterpart oracle.
+- Efficiency work for the clean `FullMC` evaluation preserves the policy being
+  tested: no heuristic confidence gates, low-impact skips, adaptive sample
+  cuts, or timeout fallbacks inside the `FullMC` comparison. Implemented
+  speedups include multiprocessing independent games, deterministic per-game
+  seeds, shared hidden deals per decision, and deterministic greedy rollout
+  policy caching. Remaining speedups are profiling, sampler-construction reuse,
+  lower-overhead rollout internals, and deeper bitmask hand/table updates.
+  Selective/adaptive Monte Carlo is a possible later product optimization, not
+  part of the current clean evaluation comparison.
 - Legacy/redundant: average payoff is only a sign-flipped version of average
   cards left, hand-strength buckets are deferred, and the current greedy oracle
   should not be the final oracle-gap reference.
@@ -678,6 +694,16 @@ Current demo command:
 
 ```text
 py demo.py
+```
+
+Current full-game evaluation command:
+
+```text
+py full_game_eval.py
+py full_game_eval.py --fast
+py full_game_eval.py --deals 2 --fast --progress-every 2 --max-turns 500
+py full_game_eval.py --deals 2 --cards-per-suit 5 --samples-per-move 4 --rollout-max-turns 40 --progress-every 2 --max-turns 200
+py full_game_eval.py --deals 8 --cards-per-suit 8 --samples-per-move 4 --rollout-max-turns 80 --workers 4 --progress-every 4
 ```
 
 Current proof benchmark commands:
