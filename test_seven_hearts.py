@@ -20,6 +20,8 @@ from seven_hearts import (
     deal_random_hands,
     endgame_urgency,
     enumerate_hidden_deals,
+    evaluate_move_exact_information_limited_policy,
+    evaluate_move_information_limited_monte_carlo,
     estimate_complete_game_metrics,
     estimate_strategy_self_play,
     evaluate_move_monte_carlo,
@@ -31,11 +33,15 @@ from seven_hearts import (
     hand_count_tuple,
     highest_legal_card_policy,
     initial_state_for_hands,
+    choose_information_limited_move,
     lowest_legal_card_policy,
     mask_to_cards,
     recommend_move,
     recommend_move_exact_imperfect_information,
+    recommend_move_exact_information_limited_policy,
+    recommend_move_information_limited_monte_carlo,
     recommend_move_monte_carlo,
+    rollout_information_limited,
     rollout_oracle,
     sample_hidden_deal,
     sample_hidden_deals,
@@ -471,6 +477,107 @@ def test_recommend_move_monte_carlo_returns_legal_move() -> None:
 
     assert result is not None
     assert result.card in {Card(Suit.HEARTS, 6), Card(Suit.HEARTS, 8)}
+
+
+def test_information_limited_policy_uses_only_actor_hand_and_public_state() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    actor_hand = hand("6H 8H")
+    first_hidden_world = {
+        0: set(actor_hand),
+        1: set(hand("5H")),
+        2: set(hand("9H")),
+        3: set(hand("7S")),
+    }
+    second_hidden_world = {
+        0: set(actor_hand),
+        1: set(hand("9H")),
+        2: set(hand("7S")),
+        3: set(hand("5H")),
+    }
+    deck = frozenset(card for cards in first_hidden_world.values() for card in cards) | {Card(Suit.HEARTS, 7)}
+
+    first_choice = choose_information_limited_move(state, first_hidden_world[0], 0, deck=deck)
+    second_choice = choose_information_limited_move(state, second_hidden_world[0], 0, deck=deck)
+
+    assert first_choice == second_choice
+
+
+def test_rollout_information_limited_completes_without_hidden_hand_leakage() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(1, 1, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H")),
+        1: set(hand("8H")),
+        2: set(hand("7S")),
+        3: set(hand("7C")),
+    }
+
+    result = rollout_information_limited(state, hands, max_turns=10, rng=random.Random(11))
+
+    assert result.winner == 0
+    assert result.final_hand_counts[0] == 0
+    assert not result.timed_out
+
+
+def test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_legal_move() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=4,
+        max_turns=20,
+        rng=random.Random(12),
+    )
+
+    assert result is not None
+    assert result.card in state.legal_moves(knowledge.hand)
+    assert result.samples == 4
+    assert result.policy_name == "information_limited_greedy_heuristic"
+
+
+def test_evaluate_move_information_limited_monte_carlo_supports_softmax_policy() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = evaluate_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        Card(Suit.HEARTS, 6),
+        samples=3,
+        max_turns=20,
+        rng=random.Random(13),
+        policy="softmax",
+        rationality=0.5,
+    )
+
+    assert result.card == Card(Suit.HEARTS, 6)
+    assert result.samples == 3
+    assert result.policy_name == "information_limited_softmax_heuristic_rationality_0.5"
 
 
 def test_monte_carlo_can_compare_moves_over_shared_hidden_deals() -> None:
@@ -1087,6 +1194,47 @@ def test_exact_imperfect_information_move_value_is_exact_for_immediate_win() -> 
     assert score.hidden_deals == 2450
     assert score.expected_value == 1.0
     assert score.value_standard_error == 0.0
+
+
+def test_exact_information_limited_policy_ev_is_exact_for_immediate_win() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(1, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H"),
+        deck=frozenset(hand("6H 8H 7S 7C")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    score = evaluate_move_exact_information_limited_policy(state, knowledge, Card(Suit.HEARTS, 6))
+
+    assert score.exhaustive
+    assert score.expected_value == 1.0
+    assert score.outcome_counts[0] == score.hidden_deals
+
+
+def test_recommend_move_exact_information_limited_policy_reports_model() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = recommend_move_exact_information_limited_policy(state, knowledge, max_turns=20)
+
+    assert result is not None
+    assert result.exhaustive
+    assert result.hidden_deals == 6
+    assert result.chosen_move in state.legal_moves(knowledge.hand)
+    assert result.policy_name == "exact_hidden_deal_expectation_with_information_limited_greedy_policy"
+    assert "information-limited greedy" in result.continuation_model
 
 
 def test_exact_imperfect_information_certificate_snapshot_for_reduced_belief_position() -> None:

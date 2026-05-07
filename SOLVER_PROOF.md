@@ -109,6 +109,14 @@ Implemented:
   cached full-information hand masks, and compact exact-solver cache keys
 - reusable hidden-deal sampler state for repeated Monte Carlo sampling
 - shared hidden-deal samples across legal moves in Monte Carlo recommendation
+- information-limited rollout through `rollout_information_limited(...)`, where
+  each simulated player chooses from only their own private hand plus public
+  table/history/count evidence
+- `recommend_move_information_limited_monte_carlo(...)`, comparing legal moves
+  over shared hidden-deal samples under a documented information-limited policy
+- deterministic greedy and softmax information-limited heuristic policies
+- exact hidden-deal EV against the declared deterministic information-limited
+  greedy policy through `recommend_move_exact_information_limited_policy(...)`
 - hidden-deal enumeration regression tests for pass constraints, known hand
   counts, and impossible constraint/count combinations
 - regression coverage that non-exhaustive exact recommendation reuses the same
@@ -122,12 +130,21 @@ Implemented:
 - regression coverage for deadlock handling, root forced-pass reporting,
   forced-pass-chain equivalence, played-card ownership during hidden-deal
   enumeration, and vector-aware hidden-deal EV tie-breaking
+- regression coverage that information-limited rollout does not expose hidden
+  hands to the acting player's move policy, labels the continuation policy, and
+  supports both greedy and softmax policy variants
+- regression coverage for exact reduced-state EV against the deterministic
+  information-limited greedy policy
+- dead/redundant helper cleanup in `seven_hearts.py`: removed the obsolete
+  scalar EV tie-breaker, old top-level hidden-deal assignment samplers that were
+  superseded by `HiddenDealSampler`, and uncalled convenience/legal-card helpers
+  that duplicated the active mask-based rules path
 
 Current verification:
 
 ```text
 py run_tests.py
-74 tests passed
+82 tests passed
 
 py proof_demo.py
 
@@ -137,7 +154,7 @@ py proof_benchmark.py --include-hard
 
 py proof_eval.py
 
-py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py
+py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py demo.py simulator.py
 ```
 
 Important current limitations:
@@ -160,35 +177,50 @@ Important current limitations:
   standard error is reported for truncated exact-enumeration results
 - hidden-deal enumeration currently uses the existing public constraint model
   and a uniform prior over enumerated deals
+- the current Monte Carlo proof-evaluation report still shows regret on the
+  multi-suit reduced-belief scenario, so practical sampled play needs more
+  tuning/validation before it can be treated as engine-quality proof
 - naive broad searches for harder hidden-belief proof positions can be very
   slow; one ad hoc multi-suit exploratory search timed out after roughly 23
   minutes without finding a useful position. Future position discovery should
   use bounded tooling with explicit limits, progress reporting, and abort
   controls.
 
-Highest-priority solver/proof work after the current proof pass:
+Done in the current proof pass:
 
-1. Build the practical imperfect-information solver path: evaluate candidate
+1. Built the practical imperfect-information solver path: evaluate candidate
    moves over shared hidden-deal samples where every simulated player uses only
-   their own private hand and public evidence.
-2. Build exact EV against declared information-limited policies for reduced
+   their own private hand and public evidence. The implementation includes
+   greedy and softmax heuristic policies.
+2. Built exact EV against declared information-limited policies for reduced
    belief states, so the sampled real-game solver has proof-sized validation
-   targets.
-3. Treat CFR/perfect-recall and public-belief equilibrium methods as later
+   targets. The deterministic greedy information-limited policy has an exact
+   reduced-state EV path.
+3. Kept the core implementation lean by removing redundant/dead helpers after
+   the bitmask and reusable hidden-deal sampler paths became canonical.
+
+Highest-priority solver/proof work left:
+
+1. Treat CFR/perfect-recall and public-belief equilibrium methods as later
    reduced-deck research, not as the required next step for a usable real-game
    solver.
-4. Extend harder benchmark discovery beyond the current 4k-state hard case:
+2. Extend harder benchmark discovery beyond the current 4k-state hard case:
    first target 100k-state reduced positions, then test whether larger
    500k/million-state cases are practical with explicit runtime limits and
    progress reporting.
-5. Continue extending bitmask representation into deeper simulation/search
+3. Continue extending bitmask representation into deeper simulation/search
    paths, especially rollout hand updates and information-limited policy caches.
-6. Add deeper hidden-deal enumeration regression tests around multi-pass
+4. Add deeper hidden-deal enumeration regression tests around multi-pass
    histories.
-7. Add more hand-authored imperfect-information snapshots with 3-5 cards per
+5. Add more hand-authored imperfect-information snapshots with 3-5 cards per
    opponent and multiple public pass constraints.
-8. Grow `proof_eval.py` into a broader engine scoreboard with more exact
+6. Grow `proof_eval.py` into a broader engine scoreboard with more exact
    positions, repeated Monte Carlo seeds, and trend snapshots.
+7. Tune and validate the practical sampled policies against the exact reduced
+   proof scenarios, especially the current multi-suit case where Monte Carlo
+   can pick a regretful move at the default sample count.
+8. Build duplicate-deal, seat-rotated evaluation for full games, using average
+   cards left and paired card advantage as the primary practical metrics.
 
 ## Formal Model
 
@@ -593,6 +625,43 @@ The implementation now computes an expected value vector for every candidate
 move and uses the same vector-aware tie-break structure as full-information
 rational play.
 
+### Perfect-Information Counterpart Oracle
+
+For practical full-game evaluation, the target oracle should be the
+perfect-information counterpart of our belief-state sampled EV agent, not merely
+the older greedy full-information structural policy.
+
+Our production agent evaluates candidate moves by sampling plausible hidden
+deals from the public belief state, applying each candidate, continuing with a
+declared information-limited policy, and averaging outcomes. The corresponding
+oracle removes only the hidden-card uncertainty:
+
+```text
+given the true full deal:
+  for each candidate legal move:
+    apply the candidate move in the true full-information state
+    evaluate or simulate continuation from that true state
+  choose the move with best expected outcome under the declared oracle
+  continuation model
+```
+
+This oracle is still an upper-bound diagnostic rather than a fair baseline,
+because it sees hidden hands. But it is a cleaner comparison than the current
+greedy oracle: it asks how much performance is lost because our agent must
+reason from a belief state instead of the actual deal.
+
+Implementation priority:
+
+1. Keep the current `rollout_oracle(...)` / `choose_oracle_move(...)` path as a
+   legacy greedy full-information diagnostic.
+2. Add a new perfect-information rollout-EV oracle that mirrors the candidate
+   comparison shape of `recommend_move_information_limited_monte_carlo(...)`,
+   but uses the true full deal directly rather than sampling hidden deals.
+3. Use exact full-information solving for this oracle only on reduced states
+   where exhaustive search is tractable; use rollout evaluation for full games.
+4. Report oracle gap against this new counterpart oracle in full-game
+   evaluation.
+
 ### True Imperfect-Information Target
 
 The final project goal is stronger than the current hidden-deal oracle. A true
@@ -609,6 +678,15 @@ Near-term bridge targets:
 - reduced-deck public-belief search where belief updates are part of the state
 - CFR or another perfect-recall extensive-form method as later research if an
   equilibrium-style solution concept is needed
+
+Possible future addition:
+
+- **True reduced-deck imperfect-information optimal solver.** For small declared
+  reduced decks, build an exact public-belief or perfect-recall solver that
+  represents player information sets explicitly, updates beliefs after public
+  plays and passes, and computes an optimal or equilibrium-style policy under a
+  documented multiplayer solution concept. This would be a research/validation
+  layer for proof-sized games, not the expected full-deck production engine.
 
 ### Sampling Approximation
 
@@ -1336,6 +1414,20 @@ The project should not claim "true imperfect-information optimality" until:
   information-limited policies, an equilibrium approximation, or another
   explicit multiplayer hidden-information objective
 
+The project may claim "true reduced-deck imperfect-information optimality" for a
+specific reduced game only when:
+
+- the reduced deck and public/private information model are declared
+- information sets are explicit and no player observes hidden cards outside
+  their information set
+- public plays and passes update beliefs inside the recurrence or equilibrium
+  algorithm
+- the multiplayer solution concept is documented
+- all reachable information states for that reduced game are solved exactly, or
+  any approximation error is explicitly bounded and reported
+- certificates distinguish the reduced-deck result from any full-deck practical
+  solver claim
+
 The project can claim "practical imperfect-information solver" when:
 
 - hidden deals are sampled or enumerated from the documented public belief
@@ -1357,6 +1449,183 @@ The project can claim "Monte Carlo evidence" when:
 - rollout policy is documented
 - the result is not described as an exact proof
 
+## Full-Game Evaluation Protocol
+
+The proof layers above validate specific solver claims, but full-game strength
+should be evaluated separately. 7 of Hearts is a four-player,
+incomplete-information, high-luck, seat-order-dependent game, so raw win rate is
+not enough by itself.
+
+The practical evaluation objective is:
+
+```text
+On the same deals and seat positions, our agent should finish with fewer cards
+left than baseline agents.
+```
+
+The primary full-game metric is average cards left. Lower is better. The
+equivalent payoff is:
+
+```text
+payoff = -cards_left
+```
+
+Because this is a direct sign flip, average payoff is optional in reports; the
+human-readable headline should be average cards left.
+
+Full-game evaluation should continue play after the first player empties their
+hand, at least until all players finish or only one player remains with cards.
+This allows true rank and finishing-distribution metrics. The exact solver may
+continue to use first-out utility internally; evaluation is allowed to report
+the richer terminal ordering and remaining-card outcomes.
+
+### Duplicate-Deal Seat Rotation
+
+The practical benchmark should use duplicate deals and seat rotation:
+
+1. Generate a random full deal.
+2. Reuse the exact same card allocation across multiple games.
+3. Rotate which agent occupies each seat.
+4. Record cards left, payoff, rank, winner, and timeout status.
+
+The first target is 1,000 random deals with four cyclic rotations, for 4,000
+games per four-agent table. Larger runs can scale from there after runtime and
+confidence intervals are measured.
+
+The four default rotations for agents `A, B, C, D` are:
+
+```text
+Game 1: A seat 0, B seat 1, C seat 2, D seat 3
+Game 2: D seat 0, A seat 1, B seat 2, C seat 3
+Game 3: C seat 0, D seat 1, A seat 2, B seat 3
+Game 4: B seat 0, C seat 1, D seat 2, A seat 3
+```
+
+All 24 seat permutations can be added later if compute is cheap enough.
+
+### Agents
+
+The initial evaluation agents are:
+
+- `Random`: choose uniformly among legal moves, pass only when forced.
+- `GreedyFurthestFromSeven`: choose the legal card with maximum
+  `abs(rank - 7)`, using deterministic card order to break ties.
+- `Heuristic`: choose the highest one-ply `score_move(...)` result.
+- `Ours`: the belief-state sampled EV agent, using shared hidden deals and a
+  documented information-limited continuation policy.
+- `Oracle`: a full-information reference that may see sampled true hands during
+  continuation. For final evaluation, this should be the perfect-information
+  counterpart of `Ours`: same candidate-EV comparison shape, but with the true
+  deal known instead of a sampled belief state. It is an upper-bound diagnostic,
+  not a fair production agent.
+
+`Ours` should not be described as a true optimal imperfect-information solver.
+That stronger claim requires explicit information sets, belief updates inside
+the recurrence or equilibrium method, and a documented multiplayer hidden-
+information solution concept. The current claim is practical and narrower:
+
+```text
+belief-state sampled first-out EV under a declared information-limited policy
+```
+
+### Full-Game Metrics
+
+Reports should include:
+
+- average cards left, lower is better
+- average payoff, higher is better, if useful for formal tables
+- win rate
+- average rank, lower is better
+- finishing distribution
+- timeout rate
+- 95% confidence intervals
+
+The main comparison statistic is paired card advantage:
+
+```text
+paired_card_advantage = baseline_cards_left - ours_cards_left
+```
+
+Positive values mean our agent finished with fewer cards than the baseline on
+matched deal/seat conditions. Confidence intervals for this statistic should be
+computed over the paired differences, not by treating the two agents as
+independent samples.
+
+### Initial Benchmark Suite
+
+The first practical benchmark suite should contain:
+
+1. Basic mixed table:
+
+```text
+Ours vs Random vs GreedyFurthestFromSeven vs Heuristic
+```
+
+2. Fixed opponent pools:
+
+```text
+Ours vs Random x3
+Ours vs GreedyFurthestFromSeven x3
+Ours vs Heuristic x3
+```
+
+3. Strong mixed table:
+
+```text
+Ours vs GreedyFurthestFromSeven vs Heuristic vs the strongest non-oracle rollout baseline
+```
+
+4. Paired card advantage against each non-oracle baseline.
+
+5. Oracle-gap analysis, reported separately:
+
+```text
+oracle_gap = ours_cards_left - oracle_cards_left
+```
+
+Lower oracle gap is better. The oracle should be used to estimate headroom, not
+as evidence that normal opponents are being modeled fairly. The older greedy
+full-information oracle is useful for regression and debugging, but should not
+be the main oracle-gap target once the perfect-information counterpart oracle is
+implemented.
+
+### Evaluation Implementation Status
+
+Implemented now:
+
+- full rules engine and legal move generation
+- one-ply heuristic recommender
+- constrained belief sampling and hidden-deal enumeration
+- information-limited rollout and Monte Carlo move recommendation
+- exact reduced-state EV against the deterministic information-limited greedy
+  policy
+- legacy greedy full-information oracle rollout with one-ply response penalty
+- proof-position reports comparing practical engines against exact
+  full-information-continuation oracle values
+
+Not implemented yet:
+
+- full-game evaluator that continues play after first-out to produce true ranks
+  and final cards-left outcomes
+- duplicate-deal, seat-rotated benchmark harness
+- paired card advantage tables and paired confidence intervals
+- `GreedyFurthestFromSeven` full-game baseline
+- perfect-information counterpart oracle for oracle-gap evaluation
+- true reduced-deck imperfect-information optimal solver with explicit
+  information sets and belief updates
+- 1,000-deal practical benchmark run
+
+Redundant or legacy under the updated plan:
+
+- average payoff as a separate headline metric is redundant with average cards
+  left because `payoff = -cards_left`
+- hand-strength bucket analysis is intentionally deferred because the bucket
+  definition is subjective and not needed for the core claim
+- the current greedy full-information oracle should remain as a regression and
+  debugging tool, but it should not be the final oracle-gap reference
+- first-out-only complete-game simulation is useful for solver-objective sanity
+  checks, but final full-game evaluation should continue beyond first-out
+
 ## Long-Term Goal
 
 The long-term proof architecture should look like this:
@@ -1368,7 +1637,7 @@ Rules engine
       -> sampled practical imperfect-information move EV for real games
         -> exact information-limited EV on reduced belief states
           -> exact full-information and hidden-deal oracle validation cases
-            -> reduced-deck public-belief / CFR-style research if needed
+            -> true reduced-deck imperfect-information optimal solver if needed
               -> heuristic policy tuned and validated against exact/sampled evidence
 ```
 

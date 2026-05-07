@@ -136,6 +136,11 @@ It currently includes:
 - Exact hand-count-consistent holder marginals when known counts are available and consistent.
 - Constrained hidden-deal sampling for simulation-ready opponent hand assignments.
 - Oracle greedy rollouts and Monte Carlo move evaluation over sampled hidden deals.
+- Information-limited rollouts and Monte Carlo recommendation over shared
+  hidden-deal samples, where each simulated player chooses from only their own
+  private hand plus public table/history/count evidence.
+- Exact hidden-deal expected value against a declared deterministic
+  information-limited greedy policy for reduced proof-sized belief states.
 - Exact full-information rational-play solving for small/late-game complete-hand states.
 - Exact full-information fixed-policy solving for comparing against declared opponent policies.
 - Exhaustive hidden-deal enumeration and exact expected value under full-information rational continuation when the belief set is small enough.
@@ -286,6 +291,14 @@ The rollout policy is called "oracle" because each simulated player can see the 
 
 The oracle move chooser now includes a one-ply response adjustment. For each candidate move, it estimates the strongest immediate move available to the next player and discounts the candidate by part of that response value. This was added because pure greedy oracle play can be too myopic: a move may look locally productive while handing the next player an even stronger response. The one-ply penalty is deliberately shallow and inspectable, avoiding recursive search while improving tactical caution.
 
+This implemented oracle is best understood as the legacy greedy
+full-information diagnostic. The target evaluation oracle is stronger and
+cleaner: it should be the perfect-information counterpart of the belief-state
+sampled EV agent. That oracle should compare candidate moves from the true full
+deal using the same candidate-EV shape as `Ours`, rather than only applying a
+one-ply greedy structural score. It remains an unfair upper-bound reference
+because it sees hidden hands, but it measures headroom more directly.
+
 Monte Carlo scores now include:
 
 - completed sample count
@@ -301,6 +314,12 @@ This layer creates a useful comparison:
 
 - `recommend_move(...)` gives the current one-move explainable heuristic recommendation.
 - `recommend_move_monte_carlo(...)` gives a rollout-backed recommendation over plausible hidden worlds.
+- `recommend_move_information_limited_monte_carlo(...)` gives a rollout-backed
+  recommendation where continuation players use an information-limited
+  heuristic policy instead of seeing the full sampled deal.
+- `recommend_move_exact_information_limited_policy(...)` gives exact
+  reduced-state EV against the deterministic information-limited greedy policy
+  when the hidden-deal set is exhaustively enumerable.
 
 When those recommendations disagree, the position is strategically interesting. The disagreement can show that a move with good immediate structure has poor long-run sampled outcomes, or that a locally scary unlock is acceptable because the sampled continuation favors the solver.
 
@@ -363,6 +382,99 @@ This layer is currently intended for reduced, late-game, or hand-authored proof
 scenarios. It should be scaled beyond the present 4k-state hard benchmark toward
 100k+ state measurements, but full-game initial positions still require Monte
 Carlo or additional exact-search optimization.
+
+## Full-Game Evaluation Plan
+
+The practical full-game evaluation target is duplicate-deal, seat-rotated
+average cards left. This is intentionally separate from exact proof validation:
+the proof layer certifies small positions and declared policies, while the
+full-game evaluator measures practical strength in the high-variance real game.
+
+The primary metric is:
+
+```text
+average cards left
+```
+
+Lower is better. The equivalent payoff is:
+
+```text
+payoff = -cards_left
+```
+
+Reports may include payoff for formal comparison, but average cards left should
+remain the headline because it is easier to read.
+
+The evaluator should continue play after the first player empties their hand,
+at least until all players finish or only one player remains with cards. This
+allows true rank and finishing-distribution metrics. Existing first-out EV
+search remains valid as the solver's internal objective; full-game evaluation
+adds a richer outcome lens.
+
+The benchmark protocol is:
+
+1. Generate a random full deal.
+2. Reuse the exact same deal across multiple games.
+3. Rotate agent seat assignments.
+4. Record cards left, payoff, rank, win/loss, and timeout status.
+
+The first scale target is 1,000 random deals with four cyclic seat rotations,
+for 4,000 games per four-agent table. Larger runs can scale up after runtime and
+confidence intervals are measured.
+
+Initial agents:
+
+- `Random`: chooses uniformly among legal moves.
+- `GreedyFurthestFromSeven`: plays the legal card with maximum
+  `abs(rank - 7)`, using deterministic card order for ties.
+- `Heuristic`: chooses the highest one-ply `score_move(...)` result.
+- `Ours`: the belief-state sampled EV agent using shared hidden deals and a
+  documented information-limited continuation policy.
+- `Oracle`: full-information upper-bound diagnostic only. For final evaluation,
+  this should be the perfect-information counterpart of `Ours`, using the true
+  deal directly instead of sampling hidden deals. The current greedy
+  full-information oracle remains useful as a legacy diagnostic but should not
+  be the main oracle-gap target.
+
+The main comparative statistic is paired card advantage:
+
+```text
+paired_card_advantage = baseline_cards_left - ours_cards_left
+```
+
+Positive values mean our agent finished with fewer cards than the baseline on
+the same deal and seat conditions. Confidence intervals should be computed over
+these paired differences.
+
+The initial practical benchmark suite should include:
+
+- `Ours vs Random vs GreedyFurthestFromSeven vs Heuristic`
+- `Ours vs Random x3`
+- `Ours vs GreedyFurthestFromSeven x3`
+- `Ours vs Heuristic x3`
+- `Ours vs GreedyFurthestFromSeven vs Heuristic vs strongest non-oracle rollout baseline`
+- paired card advantage against every non-oracle baseline
+- oracle-gap analysis reported separately
+
+`Ours` should not be described as a true optimal imperfect-information solver.
+The current defensible claim is narrower: it is a belief-state sampled first-out
+EV agent under a declared information-limited policy. True optimal
+imperfect-information play would require explicit information sets, belief
+updates inside the recurrence or equilibrium method, and a documented
+multiplayer hidden-information solution concept.
+
+Current implementation status:
+
+- Implemented: belief sampling, information-limited rollout, information-limited
+  Monte Carlo recommendation, exact reduced-state EV against the deterministic
+  information-limited greedy policy, and the legacy greedy full-information
+  oracle.
+- Not yet implemented: full-game cards-left evaluator, seat-rotated duplicate
+  deals, paired card advantage confidence intervals, `GreedyFurthestFromSeven`
+  as a full-game baseline, and the perfect-information counterpart oracle.
+- Legacy/redundant: average payoff is only a sign-flipped version of average
+  cards left, hand-strength buckets are deferred, and the current greedy oracle
+  should not be the final oracle-gap reference.
 
 ## Benchmark Scenarios
 
@@ -514,15 +626,26 @@ Validation rejects:
 
 The following items are intentionally documented as future work:
 
-- **Practical imperfect-information solver.** The current exact hidden-deal
-  layer is an oracle that reveals each enumerated deal to the continuation
-  solver. The final target is a solver where future players act only from their
-  own private hand and public evidence. Near-term steps are sampled move EV over
-  shared hidden deals with information-limited policies, exact EV against
-  declared information-limited policies on reduced states, and reduced-deck
-  public-belief or CFR-style research later only if the full game needs an
-  equilibrium-style solution concept.
+- **Practical imperfect-information solver.** The first sampled
+  information-limited rollout path now exists: future players act from only
+  their own private hand and public evidence under greedy or softmax heuristic
+  policies. The deterministic greedy information-limited policy also has an
+  exact reduced-state EV path. The current full-information hidden-deal layer
+  remains an oracle that reveals each enumerated deal to the continuation
+  solver. Near-term work is stronger validation snapshots and additional
+  declared information-limited policies.
+- **True reduced-deck imperfect-information optimal solver.** As a possible
+  future research/validation layer, solve small declared reduced decks with
+  explicit information sets, belief updates after public plays and passes, and a
+  documented multiplayer solution concept such as exact public-belief search or
+  a perfect-recall equilibrium method. This should be treated as proof-sized
+  research, not the expected full-deck production engine.
 - **Stronger multi-turn search.** The current rollout policy is greedy with oracle hand knowledge plus a one-ply response adjustment. A deeper search layer could compare candidate continuations recursively rather than choosing only the locally best oracle move at each simulated turn.
+- **Perfect-information counterpart oracle.** The current `rollout_oracle(...)`
+  path is a greedy full-information diagnostic. The evaluation oracle should be
+  upgraded to mirror the candidate-EV comparison shape of `Ours` while using the
+  true full deal directly, with exact full-information solving used only for
+  reduced tractable states and rollout evaluation used for full games.
 - **Automated weight search.** Constants are still heuristic. The shared-deal tuning harness now provides an objective surface, but it does not yet generate or optimize candidate weight sets automatically.
 - **Endgame policy testing.** Endgame urgency is currently diagnostic only. If self-play shows that late-game move preferences should change, urgency should modulate card-specific components rather than being added as a flat score.
 - **Sampler and simulation performance optimization.** Exact count-consistent sampling is principled but can be slow at larger sample counts, especially when many benchmark scenarios are evaluated. The Monte Carlo recommender now reuses sampler state and shared sampled deals across candidate moves, and core card-set operations have a bitmask path. Later work can reuse samples across repeated strategy comparisons, move rollout hands to masks, and cache deterministic information-limited policy evaluations.
@@ -548,7 +671,7 @@ Current verification:
 
 ```text
 py run_tests.py
-74 tests passed
+82 tests passed
 ```
 
 Current demo command:
