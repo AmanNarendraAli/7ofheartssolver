@@ -152,12 +152,13 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
     return agents_path, paired_path, games_path
 
 
-def print_summary(evaluation: DuplicateDealEvaluation, paths: tuple[Path, ...]) -> None:
+def print_summary(evaluation: DuplicateDealEvaluation, paths: tuple[Path, ...], elapsed_seconds: float) -> None:
     print(
         f"Full-game duplicate-deal evaluation: {evaluation.deals} deals, "
         f"{evaluation.rotations_per_deal} rotations/deal, {evaluation.games} games"
     )
     print(f"average turns: {evaluation.average_turns:.1f}, timeouts: {evaluation.timeout_rate:.1%}")
+    print(f"total elapsed: {elapsed_seconds:.1f}s")
     print("\nAgent summaries:")
     for summary in evaluation.agent_summaries:
         print(
@@ -211,6 +212,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    started = perf_counter()
     evaluation = evaluate_duplicate_deal_seat_rotation(
         default_agents(args.samples_per_move, args.rollout_max_turns, fast=args.fast),
         deals=args.deals,
@@ -222,7 +224,7 @@ def main() -> None:
         workers=args.workers,
     )
     paths = write_summary_csv(evaluation, args.output_dir)
-    print_summary(evaluation, paths)
+    print_summary(evaluation, paths, perf_counter() - started)
 
 
 if __name__ == "__main__":

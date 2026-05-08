@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum
@@ -8,7 +9,7 @@ from functools import lru_cache
 from math import exp, isnan, nan, sqrt
 from time import perf_counter
 from types import MappingProxyType
-from typing import Callable, Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, MutableMapping, Sequence
 
 
 class Suit(str, Enum):
@@ -900,6 +901,8 @@ class StrategyWeights:
 
 
 DEFAULT_WEIGHTS = StrategyWeights()
+INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY = "heuristic_greedy"
+LEGACY_INFORMATION_LIMITED_GREEDY_POLICY = "greedy"
 
 
 @dataclass(frozen=True)
@@ -927,7 +930,7 @@ class FullGameAgent:
     weights: StrategyWeights = DEFAULT_WEIGHTS
     samples_per_move: int = 24
     rollout_max_turns: int = 160
-    rollout_policy: str = "greedy"
+    rollout_policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY
     rationality: float = 1.0
 
 
@@ -1396,10 +1399,11 @@ def evaluate_move_exact_information_limited_policy_from_deals(
     enumeration: HiddenDealEnumeration,
     max_turns: int = 200,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
 ) -> ExactImperfectInformationMoveScore:
-    if policy != "greedy":
-        raise ValueError("exact information-limited policy EV currently requires deterministic greedy policy")
+    policy = normalize_information_limited_policy(policy)
+    if policy != INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY:
+        raise ValueError("exact information-limited policy EV currently requires deterministic heuristic-greedy policy")
     if state.current_player != knowledge.player:
         raise ValueError("exact information-limited evaluation requires knowledge.player to act")
     if card not in state.legal_moves(knowledge.hand):
@@ -1458,7 +1462,7 @@ def evaluate_move_exact_information_limited_policy(
     max_deals: int | None = None,
     max_turns: int = 200,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
 ) -> ExactImperfectInformationMoveScore:
     enumeration = enumerate_hidden_deals(state, knowledge, max_deals=max_deals)
     return evaluate_move_exact_information_limited_policy_from_deals(
@@ -1478,8 +1482,9 @@ def recommend_move_exact_information_limited_policy(
     max_deals: int | None = None,
     max_turns: int = 200,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
 ) -> ExactImperfectInformationResult | None:
+    policy = normalize_information_limited_policy(policy)
     legal = state.legal_moves(knowledge.hand)
     if not legal:
         return None
@@ -1509,8 +1514,8 @@ def recommend_move_exact_information_limited_policy(
         move_scores=scores,
         hidden_deals=hidden_deals,
         exhaustive=exhaustive,
-        policy_name="exact_hidden_deal_expectation_with_information_limited_greedy_policy",
-        continuation_model="players use deterministic information-limited greedy heuristic policy from their own hand and public evidence",
+        policy_name="exact_hidden_deal_expectation_with_information_limited_heuristic_greedy_policy",
+        continuation_model="players use deterministic information-limited heuristic-greedy policy from their own hand and public evidence",
     )
 
 
@@ -1568,6 +1573,15 @@ def recommend_move_monte_carlo(
     legal = state.legal_moves(knowledge.hand)
     if not legal:
         return None
+    immediate_win = immediate_winning_move(knowledge, legal)
+    if immediate_win is not None:
+        return terminal_win_monte_carlo_score(
+            state,
+            knowledge,
+            immediate_win,
+            weights,
+            "oracle_greedy_full_information_immediate_win",
+        )
     if len(legal) == 1:
         return forced_move_monte_carlo_score(legal[0], "oracle_greedy_full_information_forced_move")
 
@@ -1594,6 +1608,43 @@ def forced_move_monte_carlo_score(card: Card, policy_name: str) -> MonteCarloMov
     )
 
 
+def immediate_winning_move(knowledge: PlayerKnowledge, legal: Sequence[Card]) -> Card | None:
+    if len(knowledge.hand) != 1:
+        return None
+    only_card = next(iter(knowledge.hand))
+    return only_card if only_card in legal else None
+
+
+def is_immediate_winning_move(state: GameState, knowledge: PlayerKnowledge, card: Card) -> bool:
+    return immediate_winning_move(knowledge, state.legal_moves(knowledge.hand)) == card
+
+
+def terminal_win_monte_carlo_score(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    card: Card,
+    weights: StrategyWeights,
+    policy_name: str,
+) -> MonteCarloMoveScore:
+    average_finish_margin = 0.0
+    if state.hand_counts is not None and all(count is not None for count in state.hand_counts):
+        counts = list(state.hand_counts)
+        counts[knowledge.player] = 0
+        average_finish_margin = finish_margin(tuple(counts), knowledge.player)  # type: ignore[arg-type]
+    score = weights.monte_carlo_win_rate_weight + average_finish_margin
+    return MonteCarloMoveScore(
+        card=card,
+        score=score,
+        win_rate=1.0,
+        average_finish_margin=average_finish_margin,
+        samples=0,
+        average_turns=0.0,
+        timeout_rate=0.0,
+        win_rate_standard_error=0.0,
+        policy_name=policy_name,
+    )
+
+
 def evaluate_move_monte_carlo(
     state: GameState,
     knowledge: PlayerKnowledge,
@@ -1603,6 +1654,14 @@ def evaluate_move_monte_carlo(
     rng: random.Random | None = None,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
 ) -> MonteCarloMoveScore:
+    if is_immediate_winning_move(state, knowledge, card):
+        return terminal_win_monte_carlo_score(
+            state,
+            knowledge,
+            card,
+            weights,
+            "oracle_greedy_full_information_immediate_win",
+        )
     rng = rng or random.Random()
     hidden_deals = sample_hidden_deals(state, knowledge, samples, rng)
     return evaluate_move_monte_carlo_from_deals(state, knowledge, card, hidden_deals, max_turns, weights)
@@ -1616,6 +1675,15 @@ def evaluate_move_monte_carlo_from_deals(
     max_turns: int = 200,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
 ) -> MonteCarloMoveScore:
+    if is_immediate_winning_move(state, knowledge, card):
+        return terminal_win_monte_carlo_score(
+            state,
+            knowledge,
+            card,
+            weights,
+            "oracle_greedy_full_information_immediate_win",
+        )
+
     wins = 0
     finish_margin_total = 0.0
     turns_total = 0
@@ -1699,19 +1767,34 @@ def recommend_move_information_limited_monte_carlo(
     max_turns: int = 200,
     rng: random.Random | None = None,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
     rationality: float = 1.0,
+    policy_cache: InformationLimitedPolicyCache | None = None,
+    rollout_cache: RolloutTranspositionCache | None = None,
 ) -> MonteCarloMoveScore | None:
+    policy = normalize_information_limited_policy(policy)
     legal = state.legal_moves(knowledge.hand)
     if not legal:
         return None
+    immediate_win = immediate_winning_move(knowledge, legal)
+    if immediate_win is not None:
+        return terminal_win_monte_carlo_score(
+            state,
+            knowledge,
+            immediate_win,
+            weights,
+            f"{information_limited_policy_name(policy, rationality)}_immediate_win",
+        )
     if len(legal) == 1:
         policy_name = f"{information_limited_policy_name(policy, rationality)}_forced_move"
         return forced_move_monte_carlo_score(legal[0], policy_name)
 
     rng = rng or random.Random()
     hidden_deals = sample_hidden_deals(state, knowledge, samples_per_move, rng)
-    policy_cache: InformationLimitedPolicyCache | None = {} if policy == "greedy" else None
+    decision_policy_cache: InformationLimitedPolicyCache | None = (
+        policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None)
+    )
+    decision_rollout_cache = rollout_cache if is_deterministic_heuristic_policy(policy) else None
     results = [
         evaluate_move_information_limited_monte_carlo_from_deals(
             state,
@@ -1723,7 +1806,8 @@ def recommend_move_information_limited_monte_carlo(
             policy,
             rationality,
             rng,
-            policy_cache,
+            decision_policy_cache,
+            decision_rollout_cache,
         )
         for card in legal
     ]
@@ -1738,9 +1822,20 @@ def evaluate_move_information_limited_monte_carlo(
     max_turns: int = 200,
     rng: random.Random | None = None,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
     rationality: float = 1.0,
+    policy_cache: InformationLimitedPolicyCache | None = None,
+    rollout_cache: RolloutTranspositionCache | None = None,
 ) -> MonteCarloMoveScore:
+    policy = normalize_information_limited_policy(policy)
+    if is_immediate_winning_move(state, knowledge, card):
+        return terminal_win_monte_carlo_score(
+            state,
+            knowledge,
+            card,
+            weights,
+            f"{information_limited_policy_name(policy, rationality)}_immediate_win",
+        )
     rng = rng or random.Random()
     hidden_deals = sample_hidden_deals(state, knowledge, samples, rng)
     return evaluate_move_information_limited_monte_carlo_from_deals(
@@ -1753,7 +1848,8 @@ def evaluate_move_information_limited_monte_carlo(
         policy,
         rationality,
         rng,
-        {} if policy == "greedy" else None,
+        policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None),
+        rollout_cache if is_deterministic_heuristic_policy(policy) else None,
     )
 
 
@@ -1764,12 +1860,24 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
     hidden_deals: Iterable[HiddenDeal],
     max_turns: int = 200,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
     rationality: float = 1.0,
     rng: random.Random | None = None,
     policy_cache: InformationLimitedPolicyCache | None = None,
+    rollout_cache: RolloutTranspositionCache | None = None,
 ) -> MonteCarloMoveScore:
+    policy = normalize_information_limited_policy(policy)
     rng = rng or random.Random()
+    policy_name = information_limited_policy_name(policy, rationality)
+    if is_immediate_winning_move(state, knowledge, card):
+        return terminal_win_monte_carlo_score(
+            state,
+            knowledge,
+            card,
+            weights,
+            f"{policy_name}_immediate_win",
+        )
+
     wins = 0
     finish_margin_total = 0.0
     turns_total = 0
@@ -1791,6 +1899,7 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
             rationality,
             rng,
             policy_cache,
+            rollout_cache,
         )
         completed_samples += 1
         if result.winner == knowledge.player:
@@ -1800,7 +1909,6 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
         if result.timed_out:
             timeouts += 1
 
-    policy_name = information_limited_policy_name(policy, rationality)
     if completed_samples == 0:
         return MonteCarloMoveScore(
             card=card,
@@ -1839,11 +1947,13 @@ def rollout_information_limited(
     hands: Mapping[int, set[Card]],
     max_turns: int = 200,
     weights: StrategyWeights | Mapping[int, StrategyWeights] = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
     rationality: float = 1.0,
     rng: random.Random | None = None,
     policy_cache: InformationLimitedPolicyCache | None = None,
+    rollout_cache: RolloutTranspositionCache | None = None,
 ) -> RolloutResult:
+    policy = normalize_information_limited_policy(policy)
     rng = rng or random.Random()
     current_state = state_with_hand_counts(state, hands)
     current_hands = {player: set(hand) for player, hand in hands.items()}
@@ -1852,11 +1962,37 @@ def rollout_information_limited(
         for hand in current_hands.values()
         for card in hand
     ) | frozenset(current_state.played_cards())
+    use_rollout_cache = rollout_cache is not None and is_deterministic_heuristic_policy(policy)
+    visited: list[tuple[RolloutTranspositionCacheKey, int]] = []
 
     for turns_played in range(max_turns + 1):
+        if use_rollout_cache:
+            cache_key = rollout_transposition_cache_key(
+                current_state,
+                current_hands,
+                deck,
+                weights,
+                policy,
+                rationality,
+                max_turns - turns_played,
+            )
+            cached = rollout_cache.get(cache_key) if rollout_cache is not None else None
+            if cached is not None:
+                result = RolloutResult(
+                    cached.winner,
+                    turns_played + cached.turns_played,
+                    cached.final_hand_counts,
+                    cached.timed_out,
+                )
+                store_rollout_suffixes(rollout_cache, visited, result)
+                return result
+            visited.append((cache_key, turns_played))
+
         winner = first_empty_player(current_hands)
         if winner is not None:
-            return RolloutResult(winner, turns_played, hand_count_tuple(current_hands))
+            result = RolloutResult(winner, turns_played, hand_count_tuple(current_hands))
+            store_rollout_suffixes(rollout_cache, visited, result)
+            return result
         if turns_played == max_turns:
             break
 
@@ -1874,7 +2010,9 @@ def rollout_information_limited(
         )
         current_state, current_hands = apply_known_play(current_state, current_hands, player, card)
 
-    return RolloutResult(None, max_turns, hand_count_tuple(current_hands), timed_out=True)
+    result = RolloutResult(None, max_turns, hand_count_tuple(current_hands), timed_out=True)
+    store_rollout_suffixes(rollout_cache, visited, result)
+    return result
 
 
 def choose_information_limited_move(
@@ -1882,12 +2020,13 @@ def choose_information_limited_move(
     hand: Iterable[Card],
     player: int,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
-    policy: str = "greedy",
+    policy: str = INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY,
     rationality: float = 1.0,
     rng: random.Random | None = None,
     deck: frozenset[Card] | None = None,
     cache: InformationLimitedPolicyCache | None = None,
 ) -> Card | None:
+    policy = normalize_information_limited_policy(policy)
     hand_set = frozenset(hand)
     hand_mask = card_set_mask(hand_set)
     legal_mask = hand_mask & state.public_legal_mask()
@@ -1899,7 +2038,7 @@ def choose_information_limited_move(
         return None
 
     cache_key = None
-    if cache is not None and policy == "greedy":
+    if cache is not None and is_deterministic_heuristic_policy(policy):
         cache_key = information_limited_policy_cache_key(
             state,
             hand_mask,
@@ -1915,7 +2054,7 @@ def choose_information_limited_move(
 
     knowledge = PlayerKnowledge(player, hand_set, deck=deck)
     scores = tuple(score_move(state, knowledge, card, weights=weights) for card in legal)
-    if policy == "greedy":
+    if is_deterministic_heuristic_policy(policy):
         choice = max(scores, key=lambda scored: scored.score).card
         if cache is not None and cache_key is not None:
             cache[cache_key] = choice
@@ -1951,11 +2090,22 @@ def choose_softmax_move(scores: Iterable[MoveScore], rationality: float, rng: ra
 
 
 def information_limited_policy_name(policy: str, rationality: float) -> str:
-    if policy == "greedy":
-        return "information_limited_greedy_heuristic"
+    policy = normalize_information_limited_policy(policy)
+    if policy == INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY:
+        return "information_limited_heuristic_greedy"
     if policy == "softmax":
         return f"information_limited_softmax_heuristic_rationality_{rationality:g}"
     return f"information_limited_{policy}"
+
+
+def normalize_information_limited_policy(policy: str) -> str:
+    if policy == LEGACY_INFORMATION_LIMITED_GREEDY_POLICY:
+        return INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY
+    return policy
+
+
+def is_deterministic_heuristic_policy(policy: str) -> bool:
+    return normalize_information_limited_policy(policy) == INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY
 
 
 InformationLimitedPolicyCacheKey = tuple[
@@ -1970,7 +2120,70 @@ InformationLimitedPolicyCacheKey = tuple[
     float,
     int | None,
 ]
-InformationLimitedPolicyCache = dict[InformationLimitedPolicyCacheKey, Card | None]
+InformationLimitedPolicyCache = MutableMapping[InformationLimitedPolicyCacheKey, Card | None]
+
+
+class BoundedInformationLimitedPolicyCache(OrderedDict[InformationLimitedPolicyCacheKey, Card | None]):
+    def __init__(self, max_entries: int = 50_000) -> None:
+        super().__init__()
+        self.max_entries = max_entries
+
+    def __getitem__(self, key: InformationLimitedPolicyCacheKey) -> Card | None:
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key: InformationLimitedPolicyCacheKey, default: Card | None = None) -> Card | None:
+        if key not in self:
+            return default
+        return self[key]
+
+    def __setitem__(self, key: InformationLimitedPolicyCacheKey, value: Card | None) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if self.max_entries > 0:
+            while len(self) > self.max_entries:
+                self.popitem(last=False)
+
+
+RolloutTranspositionCacheKey = tuple[
+    tuple[tuple[int | None, int | None], ...],
+    tuple[tuple[int, int], ...],
+    int,
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    int,
+    tuple[StrategyWeights, StrategyWeights, StrategyWeights, StrategyWeights],
+    str,
+    float,
+    int,
+]
+RolloutTranspositionCache = MutableMapping[RolloutTranspositionCacheKey, RolloutResult]
+
+
+class BoundedRolloutTranspositionCache(OrderedDict[RolloutTranspositionCacheKey, RolloutResult]):
+    def __init__(self, max_entries: int = 50_000) -> None:
+        super().__init__()
+        self.max_entries = max_entries
+
+    def __getitem__(self, key: RolloutTranspositionCacheKey) -> RolloutResult:
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key: RolloutTranspositionCacheKey, default: RolloutResult | None = None) -> RolloutResult | None:
+        if key not in self:
+            return default
+        return self[key]
+
+    def __setitem__(self, key: RolloutTranspositionCacheKey, value: RolloutResult) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if self.max_entries > 0:
+            while len(self) > self.max_entries:
+                self.popitem(last=False)
 
 
 def information_limited_policy_cache_key(
@@ -1982,6 +2195,7 @@ def information_limited_policy_cache_key(
     rationality: float,
     deck: frozenset[Card] | None,
 ) -> InformationLimitedPolicyCacheKey:
+    policy = normalize_information_limited_policy(policy)
     table_key = tuple((run.low, run.high) for run in canonical_table(state.table))
     history_key = tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history)
     deck_mask = card_set_mask(deck) if deck is not None else None
@@ -2006,6 +2220,52 @@ def weights_for_player(
     if isinstance(weights, StrategyWeights):
         return weights
     return weights.get(player, DEFAULT_WEIGHTS)
+
+
+def canonical_rollout_weights(
+    weights: StrategyWeights | Mapping[int, StrategyWeights],
+) -> tuple[StrategyWeights, StrategyWeights, StrategyWeights, StrategyWeights]:
+    return tuple(weights_for_player(weights, player) for player in range(4))  # type: ignore[return-value]
+
+
+def rollout_transposition_cache_key(
+    state: GameState,
+    hands: Mapping[int, set[Card]],
+    deck: frozenset[Card],
+    weights: StrategyWeights | Mapping[int, StrategyWeights],
+    policy: str,
+    rationality: float,
+    remaining_turns: int,
+) -> RolloutTranspositionCacheKey:
+    policy = normalize_information_limited_policy(policy)
+    return (
+        tuple((run.low, run.high) for run in canonical_table(state.table)),
+        tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history),
+        state.current_player,
+        tuple(card_set_mask(hands[player]) for player in range(4)),  # type: ignore[return-value]
+        hand_count_tuple(hands),
+        card_set_mask(deck),
+        canonical_rollout_weights(weights),
+        policy,
+        rationality,
+        remaining_turns,
+    )
+
+
+def store_rollout_suffixes(
+    cache: RolloutTranspositionCache | None,
+    visited: Iterable[tuple[RolloutTranspositionCacheKey, int]],
+    result: RolloutResult,
+) -> None:
+    if cache is None:
+        return
+    for key, turns_at_state in visited:
+        cache[key] = RolloutResult(
+            result.winner,
+            result.turns_played - turns_at_state,
+            result.final_hand_counts,
+            result.timed_out,
+        )
 
 
 def choose_oracle_move(
@@ -2239,6 +2499,8 @@ def choose_full_game_agent_move(
     agent: FullGameAgent,
     rng: random.Random,
     deck: frozenset[Card] | None = None,
+    policy_cache: InformationLimitedPolicyCache | None = None,
+    rollout_cache: RolloutTranspositionCache | None = None,
 ) -> Card | None:
     legal = state.legal_moves(hands[player])
     if not legal:
@@ -2266,6 +2528,8 @@ def choose_full_game_agent_move(
             weights=agent.weights,
             policy=agent.rollout_policy,
             rationality=agent.rationality,
+            policy_cache=policy_cache,
+            rollout_cache=rollout_cache,
         )
         return recommendation.card if recommendation is not None else None
     if agent.policy == "oracle_greedy":
@@ -2289,6 +2553,8 @@ def simulate_full_game_to_completion(
     deck = deck or frozenset(card for hand in current_hands.values() for card in hand)
     state = initial_state_for_hands(current_hands)
     finish_order: list[int] = []
+    policy_cache: InformationLimitedPolicyCache = BoundedInformationLimitedPolicyCache()
+    rollout_cache: RolloutTranspositionCache = BoundedRolloutTranspositionCache()
 
     for turns_played in range(max_turns + 1):
         active = unfinished_players(current_hands)
@@ -2311,7 +2577,16 @@ def simulate_full_game_to_completion(
         if player != state.current_player:
             state = replace_current_player(state, player)
 
-        card = choose_full_game_agent_move(state, current_hands, player, agents_by_seat[player], rng, deck)
+        card = choose_full_game_agent_move(
+            state,
+            current_hands,
+            player,
+            agents_by_seat[player],
+            rng,
+            deck,
+            policy_cache,
+            rollout_cache,
+        )
         state, current_hands = apply_known_play(state, current_hands, player, card)
         if not current_hands[player] and player not in finish_order:
             finish_order.append(player)

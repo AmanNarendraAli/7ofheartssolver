@@ -131,9 +131,9 @@ Implemented:
   table/history/count evidence
 - `recommend_move_information_limited_monte_carlo(...)`, comparing legal moves
   over shared hidden-deal samples under a documented information-limited policy
-- deterministic greedy and softmax information-limited heuristic policies
+- deterministic heuristic-greedy and softmax information-limited heuristic policies
 - exact hidden-deal EV against the declared deterministic information-limited
-  greedy policy through `recommend_move_exact_information_limited_policy(...)`
+  heuristic-greedy policy through `recommend_move_exact_information_limited_policy(...)`
 - hidden-deal enumeration regression tests for pass constraints, known hand
   counts, and impossible constraint/count combinations
 - regression coverage that non-exhaustive exact recommendation reuses the same
@@ -151,7 +151,7 @@ Implemented:
   hands to the acting player's move policy, labels the continuation policy, and
   supports both greedy and softmax policy variants
 - regression coverage for exact reduced-state EV against the deterministic
-  information-limited greedy policy
+  information-limited heuristic-greedy policy
 - dead/redundant helper cleanup in `seven_hearts.py`: removed the obsolete
   scalar EV tie-breaker, old top-level hidden-deal assignment samplers that were
   superseded by `HiddenDealSampler`, and uncalled convenience/legal-card helpers
@@ -216,10 +216,10 @@ Done in the current proof pass:
 1. Built the practical imperfect-information solver path: evaluate candidate
    moves over shared hidden-deal samples where every simulated player uses only
    their own private hand and public evidence. The implementation includes
-   greedy and softmax heuristic policies.
+   heuristic-greedy and softmax heuristic policies.
 2. Built exact EV against declared information-limited policies for reduced
    belief states, so the sampled real-game solver has proof-sized validation
-   targets. The deterministic greedy information-limited policy has an exact
+   targets. The deterministic heuristic-greedy information-limited policy has an exact
    reduced-state EV path.
 3. Kept the core implementation lean by removing redundant/dead helpers after
    the bitmask and reusable hidden-deal sampler paths became canonical.
@@ -1388,15 +1388,33 @@ Phase 2 keeps the same `FullMC` decision semantics while reducing inner-loop
 cost:
 
 - profile reduced-deck Monte Carlo runs before rewriting internals
+- implemented: immediate-win shortcut: if a candidate move empties the current
+  player's hand, choose that terminal move without sampling
 - cache hidden-deal sampler construction per decision state
-- implemented: cache deterministic greedy information-limited rollout policy
+- implemented: cache deterministic heuristic-greedy information-limited rollout policy
   choices by public state, actor hand, hand counts, deck, and weight/policy
   settings inside each Monte Carlo decision
+- implemented: promote deterministic heuristic-greedy rollout policy caching from
+  per-decision scope to a bounded per-game cache
+- implemented: add a rollout transposition cache for deterministic continuation policies,
+  keyed by compact public table/history state, current player, hand masks, hand
+  counts, deck, weights, policy settings, and remaining rollout budget
 - reduce repeated `GameState`, `PlayerKnowledge`, opponent-model, and set-copy
   churn inside rollouts
 - extend bitmask hand/table updates deeper into information-limited rollouts
+- add a conservative forced-chain win detector only if the win is provable from
+  public state plus the actor's known hand; false negatives are acceptable, but
+  false positives would invalidate the clean evaluation
 - optionally parallelize hidden-deal samples within a decision only after
   game-level multiprocessing is measured
+
+Explicitly out of scope for the clean `FullMC` evaluation:
+
+- adaptive sample budgets, confidence gates, low-impact heuristic skips, timeout
+  fallbacks, or any shortcut that allows the heuristic model to override a
+  meaningful Monte Carlo decision
+- replacing Monte Carlo with exact late-game solving in the primary `FullMC`
+  agent; that should be reported as a separate agent variant if added
 
 Potential Phase 3, for a later product agent, is selective/adaptive Monte Carlo:
 use heuristic gates, high-impact triggers, adaptive sample budgets, and
@@ -1663,7 +1681,7 @@ Implemented now:
 - one-ply heuristic recommender
 - constrained belief sampling and hidden-deal enumeration
 - information-limited rollout and Monte Carlo move recommendation
-- exact reduced-state EV against the deterministic information-limited greedy
+- exact reduced-state EV against the deterministic information-limited heuristic-greedy
   policy
 - legacy greedy full-information oracle rollout with one-ply response penalty
 - proof-position reports comparing practical engines against exact

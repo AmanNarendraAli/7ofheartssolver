@@ -140,7 +140,7 @@ It currently includes:
   hidden-deal samples, where each simulated player chooses from only their own
   private hand plus public table/history/count evidence.
 - Exact hidden-deal expected value against a declared deterministic
-  information-limited greedy policy for reduced proof-sized belief states.
+  information-limited heuristic-greedy policy for reduced proof-sized belief states.
 - Exact full-information rational-play solving for small/late-game complete-hand states.
 - Exact full-information fixed-policy solving for comparing against declared opponent policies.
 - Exhaustive hidden-deal enumeration and exact expected value under full-information rational continuation when the belief set is small enough.
@@ -318,7 +318,7 @@ This layer creates a useful comparison:
   recommendation where continuation players use an information-limited
   heuristic policy instead of seeing the full sampled deal.
 - `recommend_move_exact_information_limited_policy(...)` gives exact
-  reduced-state EV against the deterministic information-limited greedy policy
+  reduced-state EV against the deterministic information-limited heuristic-greedy policy
   when the hidden-deal set is exhaustively enumerable.
 
 When those recommendations disagree, the position is strategically interesting. The disagreement can show that a move with good immediate structure has poor long-run sampled outcomes, or that a locally scary unlock is acceptable because the sampled continuation favors the solver.
@@ -467,15 +467,16 @@ Current implementation status:
 
 - Implemented: belief sampling, information-limited rollout, information-limited
   Monte Carlo recommendation, exact reduced-state EV against the deterministic
-  information-limited greedy policy, the legacy greedy full-information oracle,
+  information-limited heuristic-greedy policy, the legacy greedy full-information oracle,
   full-game cards-left/rank evaluation, duplicate-deal cyclic seat rotation,
   paired card advantage summaries with standard errors, and
   `GreedyFurthestFromSeven` as a full-game baseline. `full_game_eval.py` also
   supports progress reporting, deterministic per-game seeds, `--workers`
   multiprocessing across independent rotation games, detailed `games.csv`
-  output, and a fast heuristic-`Ours` mode for cheap evaluator smoke tests.
-  Reduced-deck full-game evaluation is available through `--cards-per-suit`;
-  for example, `--cards-per-suit 5` uses ranks 5 through 9 in every suit.
+  output, final total elapsed-time reporting, and a fast heuristic-`Ours` mode
+  for cheap evaluator smoke tests. Reduced-deck full-game evaluation is
+  available through `--cards-per-suit`; for example, `--cards-per-suit 5` uses
+  ranks 5 through 9 in every suit.
 - Not yet implemented: large 1,000-deal practical benchmark runs, 95% paired
   confidence intervals in the report, and the perfect-information counterpart
   oracle.
@@ -483,11 +484,16 @@ Current implementation status:
   tested: no heuristic confidence gates, low-impact skips, adaptive sample
   cuts, or timeout fallbacks inside the `FullMC` comparison. Implemented
   speedups include multiprocessing independent games, deterministic per-game
-  seeds, shared hidden deals per decision, and deterministic greedy rollout
-  policy caching. Remaining speedups are profiling, sampler-construction reuse,
-  lower-overhead rollout internals, and deeper bitmask hand/table updates.
-  Selective/adaptive Monte Carlo is a possible later product optimization, not
-  part of the current clean evaluation comparison.
+  seeds, shared hidden deals per decision, immediate-win terminal shortcuts,
+  deterministic heuristic-greedy rollout policy caching inside each decision,
+  bounded per-game deterministic policy caching, and deterministic rollout
+  transposition caching. Remaining safe speedups are conservative forced-chain
+  win proofs, sampler-construction reuse beyond the existing per-call sampler,
+  bounded per-worker deterministic policy caches if measurements justify them,
+  lower-overhead rollout internals, and deeper bitmask hand/table updates. Exact
+  late-game solving, adaptive budgets, and heuristic gates should be reported as
+  separate agent variants if added; they are not part of the current clean
+  `FullMC` comparison.
 - Legacy/redundant: average payoff is only a sign-flipped version of average
   cards left, hand-strength buckets are deferred, and the current greedy oracle
   should not be the final oracle-gap reference.

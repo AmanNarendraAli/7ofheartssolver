@@ -2,6 +2,8 @@ import math
 import random
 
 from seven_hearts import (
+    BoundedInformationLimitedPolicyCache,
+    BoundedRolloutTranspositionCache,
     Card,
     FullInformationState,
     GameState,
@@ -44,6 +46,7 @@ from seven_hearts import (
     recommend_move_information_limited_monte_carlo,
     recommend_move_monte_carlo,
     reduced_deck,
+    rollout_transposition_cache_key,
     rollout_information_limited,
     rollout_oracle,
     sample_hidden_deal,
@@ -498,6 +501,24 @@ def test_recommend_move_monte_carlo_skips_forced_move_sampling() -> None:
     assert result.policy_name == "oracle_greedy_full_information_forced_move"
 
 
+def test_recommend_move_monte_carlo_shortcuts_immediate_win() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(1, 2, 3, 4),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(player=0, hand=hand("6H"))
+
+    result = recommend_move_monte_carlo(state, knowledge, samples_per_move=20, rng=random.Random(6))
+
+    assert result is not None
+    assert result.card == Card(Suit.HEARTS, 6)
+    assert result.samples == 0
+    assert result.win_rate == 1.0
+    assert result.average_finish_margin == 2.0
+    assert result.policy_name == "oracle_greedy_full_information_immediate_win"
+
+
 def test_information_limited_policy_uses_only_actor_hand_and_public_state() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -545,6 +566,70 @@ def test_rollout_information_limited_completes_without_hidden_hand_leakage() -> 
     assert not result.timed_out
 
 
+def test_rollout_information_limited_transposition_cache_preserves_result() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 2, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H 9H")),
+        2: set(hand("7S")),
+        3: set(hand("7C")),
+    }
+    cache = BoundedRolloutTranspositionCache()
+
+    uncached = rollout_information_limited(state, hands, max_turns=10, rng=random.Random(11))
+    cached_first = rollout_information_limited(
+        state,
+        hands,
+        max_turns=10,
+        rng=random.Random(11),
+        rollout_cache=cache,
+    )
+    cached_second = rollout_information_limited(
+        state,
+        hands,
+        max_turns=10,
+        rng=random.Random(11),
+        rollout_cache=cache,
+    )
+
+    assert cached_first == uncached
+    assert cached_second == uncached
+    assert len(cache) > 0
+
+
+def test_rollout_transposition_cache_key_includes_weights_and_budget() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 2, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H 9H")),
+        2: set(hand("7S")),
+        3: set(hand("7C")),
+    }
+    deck = frozenset(card for cards in hands.values() for card in cards) | {Card(Suit.HEARTS, 7)}
+    default_key = rollout_transposition_cache_key(state, hands, deck, StrategyWeights(), "heuristic_greedy", 1.0, 10)
+    changed_weights_key = rollout_transposition_cache_key(
+        state,
+        hands,
+        deck,
+        StrategyWeights(response_penalty=0.9),
+        "heuristic_greedy",
+        1.0,
+        10,
+    )
+    changed_budget_key = rollout_transposition_cache_key(state, hands, deck, StrategyWeights(), "heuristic_greedy", 1.0, 9)
+
+    assert changed_weights_key != default_key
+    assert changed_budget_key != default_key
+
+
 def test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_legal_move() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -568,7 +653,110 @@ def test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_l
     assert result is not None
     assert result.card in state.legal_moves(knowledge.hand)
     assert result.samples == 4
-    assert result.policy_name == "information_limited_greedy_heuristic"
+    assert result.policy_name == "information_limited_heuristic_greedy"
+
+
+def test_information_limited_monte_carlo_shared_policy_cache_preserves_result() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {
+            Suit.HEARTS: SuitRun(low=7, high=7),
+            Suit.SPADES: SuitRun(low=7, high=7),
+        },
+        hand_counts=(4, 2, 2, 2),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H 6S 8S"),
+        deck=frozenset(hand("6H 8H 6S 8S 5H 9H 5S 9S 7C 7D"))
+        | {Card(Suit.HEARTS, 7), Card(Suit.SPADES, 7)},
+    )
+    shared_cache = BoundedInformationLimitedPolicyCache()
+
+    uncached = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=4,
+        max_turns=20,
+        rng=random.Random(12),
+    )
+    cached = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=4,
+        max_turns=20,
+        rng=random.Random(12),
+        policy_cache=shared_cache,
+    )
+
+    assert cached == uncached
+    assert len(shared_cache) > 0
+
+
+def test_information_limited_monte_carlo_accepts_legacy_greedy_alias() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    renamed = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=4,
+        max_turns=20,
+        rng=random.Random(12),
+        policy="heuristic_greedy",
+    )
+    legacy = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=4,
+        max_turns=20,
+        rng=random.Random(12),
+        policy="greedy",
+    )
+
+    assert legacy == renamed
+    assert legacy is not None
+    assert legacy.policy_name == "information_limited_heuristic_greedy"
+
+
+def test_information_limited_monte_carlo_softmax_does_not_use_deterministic_caches() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+    policy_cache = BoundedInformationLimitedPolicyCache()
+    rollout_cache = BoundedRolloutTranspositionCache()
+
+    result = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=3,
+        max_turns=20,
+        rng=random.Random(13),
+        policy="softmax",
+        rationality=0.5,
+        policy_cache=policy_cache,
+        rollout_cache=rollout_cache,
+    )
+
+    assert result is not None
+    assert result.samples == 3
+    assert len(policy_cache) == 0
+    assert len(rollout_cache) == 0
 
 
 def test_recommend_move_information_limited_monte_carlo_skips_forced_move_sampling() -> None:
@@ -594,7 +782,35 @@ def test_recommend_move_information_limited_monte_carlo_skips_forced_move_sampli
     assert result is not None
     assert result.card == Card(Suit.HEARTS, 6)
     assert result.samples == 0
-    assert result.policy_name == "information_limited_greedy_heuristic_forced_move"
+    assert result.policy_name == "information_limited_heuristic_greedy_forced_move"
+
+
+def test_recommend_move_information_limited_monte_carlo_shortcuts_immediate_win() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(1, 2, 3, 4),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H"),
+        deck=frozenset(hand("6H 5H 9H 7S 7C")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=20,
+        max_turns=20,
+        rng=random.Random(12),
+    )
+
+    assert result is not None
+    assert result.card == Card(Suit.HEARTS, 6)
+    assert result.samples == 0
+    assert result.win_rate == 1.0
+    assert result.average_finish_margin == 2.0
+    assert result.policy_name == "information_limited_heuristic_greedy_immediate_win"
 
 
 def test_evaluate_move_information_limited_monte_carlo_supports_softmax_policy() -> None:
@@ -1429,8 +1645,8 @@ def test_recommend_move_exact_information_limited_policy_reports_model() -> None
     assert result.exhaustive
     assert result.hidden_deals == 6
     assert result.chosen_move in state.legal_moves(knowledge.hand)
-    assert result.policy_name == "exact_hidden_deal_expectation_with_information_limited_greedy_policy"
-    assert "information-limited greedy" in result.continuation_model
+    assert result.policy_name == "exact_hidden_deal_expectation_with_information_limited_heuristic_greedy_policy"
+    assert "information-limited heuristic-greedy" in result.continuation_model
 
 
 def test_exact_imperfect_information_certificate_snapshot_for_reduced_belief_position() -> None:
