@@ -113,8 +113,12 @@ Implemented:
 - deterministic per-game seeds and `--workers` multiprocessing for independent
   duplicate-deal rotation games, with results sorted back into deal/rotation
   order for stable serial/parallel reports
+- each `full_game_eval.py` run writes a unique timestamp/PID report directory
+  containing `games.csv`, `agent_summary.csv`, `paired_card_advantage.csv`,
+  `run_metadata.json`, `run_parameters.csv`, and `agent_parameters.csv`
 - detailed per-rotation `games.csv` report output with seeds, seat agents,
-  winners, ranks, cards left, turns, and timeout flags
+  winners, ranks, cards left, turns, and timeout flags; run-level and active
+  per-agent hyperparameters are logged alongside the outcome CSVs
 - reduced-deck full-game evaluation through `--cards-per-suit`, using a rank
   window centered on 7, so `--cards-per-suit 5` runs ranks 5 through 9 in each
   suit while preserving the normal table/turn rules
@@ -1379,8 +1383,9 @@ Phase 1 focuses on using compute better without changing choices:
   the same random stream per rotation game
 - preserved: fixed sample counts and fixed rollout limits for every meaningful
   `FullMC` decision
-- implemented: progress reporting plus complete summary/detail CSV outputs,
-  including `games.csv` for per-rotation auditability
+- implemented: progress reporting plus complete per-run report directories,
+  including `games.csv` for per-rotation auditability and metadata/parameter
+  CSVs for eval args, Monte Carlo settings, and heuristic weights
 - supported: reduced-deck tiers, such as `--cards-per-suit 8`, as explicitly
   labeled clean evaluation tiers before scaling to full-deck games
 

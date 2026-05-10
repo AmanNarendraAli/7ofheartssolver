@@ -1,0 +1,128 @@
+{
+  "agents": [
+    {
+      "heuristic_weights": {
+        "future_chain_own_credit": 0.75,
+        "future_chain_unseen_penalty": 0.35,
+        "gate_card_credit": 1.0,
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0,
+        "opponent_runway_penalty": 0.08,
+        "opponent_unlock_risk": 2.0,
+        "race_pressure_credit": 0.25,
+        "response_penalty": 0.35,
+        "self_unlock": 3.0,
+        "tail_base_credit": 2.6,
+        "tail_distance_penalty": 0.16
+      },
+      "monte_carlo_score_weights": {
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0
+      },
+      "name": "Ours",
+      "policy": "heuristic",
+      "rationality": 1.0,
+      "rollout_max_turns": 160,
+      "rollout_policy": "heuristic_greedy",
+      "samples_per_move": 24
+    },
+    {
+      "heuristic_weights": {
+        "future_chain_own_credit": 0.75,
+        "future_chain_unseen_penalty": 0.35,
+        "gate_card_credit": 1.0,
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0,
+        "opponent_runway_penalty": 0.08,
+        "opponent_unlock_risk": 2.0,
+        "race_pressure_credit": 0.25,
+        "response_penalty": 0.35,
+        "self_unlock": 3.0,
+        "tail_base_credit": 2.6,
+        "tail_distance_penalty": 0.16
+      },
+      "monte_carlo_score_weights": {
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0
+      },
+      "name": "Random",
+      "policy": "random",
+      "rationality": 1.0,
+      "rollout_max_turns": 160,
+      "rollout_policy": "heuristic_greedy",
+      "samples_per_move": 24
+    },
+    {
+      "heuristic_weights": {
+        "future_chain_own_credit": 0.75,
+        "future_chain_unseen_penalty": 0.35,
+        "gate_card_credit": 1.0,
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0,
+        "opponent_runway_penalty": 0.08,
+        "opponent_unlock_risk": 2.0,
+        "race_pressure_credit": 0.25,
+        "response_penalty": 0.35,
+        "self_unlock": 3.0,
+        "tail_base_credit": 2.6,
+        "tail_distance_penalty": 0.16
+      },
+      "monte_carlo_score_weights": {
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0
+      },
+      "name": "Greedy",
+      "policy": "greedy_furthest_from_seven",
+      "rationality": 1.0,
+      "rollout_max_turns": 160,
+      "rollout_policy": "heuristic_greedy",
+      "samples_per_move": 24
+    },
+    {
+      "heuristic_weights": {
+        "future_chain_own_credit": 0.75,
+        "future_chain_unseen_penalty": 0.35,
+        "gate_card_credit": 1.0,
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0,
+        "opponent_runway_penalty": 0.08,
+        "opponent_unlock_risk": 2.0,
+        "race_pressure_credit": 0.25,
+        "response_penalty": 0.35,
+        "self_unlock": 3.0,
+        "tail_base_credit": 2.6,
+        "tail_distance_penalty": 0.16
+      },
+      "monte_carlo_score_weights": {
+        "monte_carlo_timeout_penalty": 10.0,
+        "monte_carlo_win_rate_weight": 100.0
+      },
+      "name": "Heuristic",
+      "policy": "heuristic",
+      "rationality": 1.0,
+      "rollout_max_turns": 160,
+      "rollout_policy": "heuristic_greedy",
+      "samples_per_move": 24
+    }
+  ],
+  "command": "full_game_eval.py --deals 1 --fast --cards-per-suit 5 --max-turns 80 --progress-every 0 --output-dir full_game_reports\\smoke_test_runs",
+  "created_at": "2026-05-10T15:56:13+05:30",
+  "duplicate_deal": {
+    "primary_agent_name": "Ours",
+    "rotations_per_deal": 4
+  },
+  "elapsed_seconds": 0.05286410008557141,
+  "eval_args": {
+    "cards_per_suit": 5,
+    "deals": 1,
+    "fast": true,
+    "max_turns": 80,
+    "output_dir": "full_game_reports\\smoke_test_runs",
+    "progress_every": 0,
+    "rollout_max_turns": 40,
+    "samples_per_move": 2,
+    "seed": 7,
+    "workers": 1
+  },
+  "output_dir": "full_game_reports\\smoke_test_runs\\run_20260510_155613"
+}

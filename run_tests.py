@@ -60,6 +60,7 @@ TESTS = [
     test_seven_hearts.test_full_game_to_completion_reports_final_ranks_and_cards_left,
     test_seven_hearts.test_duplicate_deal_seat_rotation_reports_paired_card_advantage,
     test_seven_hearts.test_duplicate_deal_evaluation_reports_progress,
+    test_seven_hearts.test_full_game_eval_report_runs_are_unique_and_parameterized,
     test_seven_hearts.test_duplicate_deal_evaluation_supports_reduced_decks,
     test_seven_hearts.test_opponent_model_reports_impossible_known_counts,
     test_seven_hearts.test_score_components_are_immutable,

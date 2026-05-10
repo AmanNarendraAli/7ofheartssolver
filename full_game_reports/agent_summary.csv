@@ -1,0 +1,5 @@
+agent,seats_played,win_rate,average_cards_left,average_rank
+Greedy,80,0.325000,0.325000,2.412500
+Heuristic,80,0.250000,0.362500,2.537500
+Ours,80,0.262500,0.262500,2.350000
+Random,80,0.162500,0.337500,2.700000

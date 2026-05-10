@@ -1,0 +1,5 @@
+deal_index,rotation_index,seed,seat_0_agent,seat_1_agent,seat_2_agent,seat_3_agent,winner_seat,winner_agent,finish_order,seat_0_rank,seat_1_rank,seat_2_rank,seat_3_rank,seat_0_cards_left,seat_1_cards_left,seat_2_cards_left,seat_3_cards_left,turns_played,timed_out
+1,1,5082513832886728665,Ours,Random,Greedy,Heuristic,3,Heuristic,3 0 1 2,2,3,4,1,0,0,2,0,21,0
+1,2,545198181100374566,Heuristic,Ours,Random,Greedy,3,Greedy,3 0 1 2,2,3,4,1,0,0,2,0,21,0
+1,3,5215389816265151663,Greedy,Heuristic,Ours,Random,3,Random,3 0 1 2,2,3,4,1,0,0,1,0,21,0
+1,4,8738681121152269347,Random,Greedy,Heuristic,Ours,3,Ours,3 0 1 2,2,3,4,1,0,0,2,0,21,0

@@ -1,0 +1,19 @@
+parameter,value
+created_at,2026-05-10T16:06:05+05:30
+command,full_game_eval.py --deals 1 --fast --cards-per-suit 5 --max-turns 80 --progress-every 0 --output-dir full_game_reports\smoke_test_runs_v3
+output_dir,full_game_reports\smoke_test_runs_v3\run_20260510_160605_869522_pid9748
+eval_args.deals,1
+eval_args.max_turns,80
+eval_args.samples_per_move,2
+eval_args.rollout_max_turns,40
+eval_args.cards_per_suit,5
+eval_args.seed,7
+eval_args.output_dir,full_game_reports\smoke_test_runs_v3
+eval_args.fast,True
+eval_args.progress_every,0
+eval_args.workers,1
+duplicate_deal.primary_agent_name,Ours
+duplicate_deal.rotations_per_deal,4
+implementation_defaults.information_limited_policy_cache_max_entries,50000
+implementation_defaults.rollout_transposition_cache_max_entries,50000
+elapsed_seconds,0.04254769999533892

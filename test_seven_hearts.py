@@ -1076,6 +1076,64 @@ def test_duplicate_deal_evaluation_records_deterministic_game_results() -> None:
     ]
 
 
+def test_full_game_eval_report_runs_are_unique_and_parameterized() -> None:
+    import argparse
+    import tempfile
+    from pathlib import Path
+
+    from full_game_eval import build_run_metadata, unique_run_output_dir, write_metadata_reports
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_dir = Path(temp_dir)
+        first_run = unique_run_output_dir(output_dir)
+        second_run = unique_run_output_dir(output_dir)
+        assert first_run != second_run
+        assert first_run.exists()
+        assert second_run.exists()
+
+        agents = (
+            FullGameAgent(
+                "Ours",
+                "information_limited_monte_carlo",
+                samples_per_move=5,
+                rollout_max_turns=30,
+                weights=StrategyWeights(self_unlock=4.0),
+            ),
+            FullGameAgent("Random", "random"),
+            FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+            FullGameAgent("Heuristic", "heuristic"),
+        )
+        args = argparse.Namespace(
+            deals=3,
+            max_turns=200,
+            samples_per_move=5,
+            rollout_max_turns=30,
+            cards_per_suit=7,
+            seed=11,
+            output_dir=output_dir,
+            fast=False,
+            progress_every=0,
+            workers=1,
+        )
+
+        metadata = build_run_metadata(args, agents, first_run, elapsed_seconds=1.25)
+        json_path, run_csv_path, agent_csv_path = write_metadata_reports(metadata, agents, first_run)
+
+        assert metadata["eval_args"]["samples_per_move"] == 5
+        assert metadata["agents"][0]["policy"] == "information_limited_monte_carlo"
+        assert metadata["agents"][0]["uses_monte_carlo"]
+        assert metadata["agents"][0]["uses_heuristic_weights"]
+        assert metadata["agents"][0]["monte_carlo"]["rollout_max_turns"] == 30
+        assert metadata["agents"][0]["heuristic_weights"]["self_unlock"] == 4.0
+        assert metadata["agents"][0]["monte_carlo"]["score_weights"]["monte_carlo_win_rate_weight"] == 100.0
+        assert metadata["implementation_defaults"]["rollout_transposition_cache_max_entries"] == 50_000
+        assert json_path.exists()
+        assert "eval_args.samples_per_move,5" in run_csv_path.read_text(encoding="utf-8")
+        agent_csv = agent_csv_path.read_text(encoding="utf-8")
+        assert "Ours,information_limited_monte_carlo,heuristic_weights.self_unlock,4.0" in agent_csv
+        assert "Random,random,heuristic_weights.self_unlock" not in agent_csv
+
+
 def test_duplicate_deal_evaluation_supports_reduced_decks() -> None:
     agents = (
         FullGameAgent("Ours", "information_limited_monte_carlo", samples_per_move=1, rollout_max_turns=20),
