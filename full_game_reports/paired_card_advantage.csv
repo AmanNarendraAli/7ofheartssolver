@@ -1,4 +1,0 @@
-primary_agent,baseline_agent,comparisons,average_advantage,standard_error
-Ours,Greedy,80,0.062500,0.111582
-Ours,Heuristic,80,0.100000,0.111945
-Ours,Random,80,0.075000,0.106401

@@ -20,11 +20,13 @@ from seven_hearts import (
     card_from_index,
     card_index,
     card_set_mask,
+    choose_information_limited_move_from_mask,
+    choose_full_game_agent_move,
     deal_random_hands,
-    endgame_urgency,
     enumerate_hidden_deals,
     evaluate_move_exact_information_limited_policy,
     evaluate_move_information_limited_monte_carlo,
+    evaluate_move_perfect_information_rollout_ev,
     estimate_complete_game_metrics,
     estimate_strategy_self_play,
     evaluate_duplicate_deal_seat_rotation,
@@ -33,21 +35,27 @@ from seven_hearts import (
     format_exact_imperfect_information_certificate,
     format_exact_solver_certificate,
     future_chain_impact,
+    first_empty_player_mask,
     full_deck,
     hand_count_tuple,
+    hand_masks_from_hands,
     highest_legal_card_policy,
     initial_state_for_hands,
     choose_information_limited_move,
     lowest_legal_card_policy,
+    mask_after_play,
+    mask_hand_count_tuple,
     mask_to_cards,
     recommend_move,
     recommend_move_exact_imperfect_information,
     recommend_move_exact_information_limited_policy,
     recommend_move_information_limited_monte_carlo,
     recommend_move_monte_carlo,
+    recommend_move_perfect_information_rollout_ev,
     reduced_deck,
     rollout_transposition_cache_key,
     rollout_information_limited,
+    rollout_information_limited_masks,
     rollout_oracle,
     sample_hidden_deal,
     sample_hidden_deals,
@@ -167,6 +175,21 @@ def test_multi_pass_removes_cards_legal_at_each_pass_moment() -> None:
     assert Card(Suit.HEARTS, 5) not in model.possible_cards[1]
 
 
+def test_opponent_model_rejects_history_that_does_not_match_table() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=6, high=7)},
+        history=(MoveEvent(0, Card(Suit.HEARTS, 7)),),
+    )
+    knowledge = PlayerKnowledge(player=0, hand=hand("AH 2H 3H 4H 5H 9H 10H JH QH KH 7C 7D 7S"))
+
+    try:
+        build_opponent_model(state, knowledge)
+    except ValueError as error:
+        assert "history" in str(error)
+    else:
+        raise AssertionError("expected mismatched public history to raise ValueError")
+
+
 def test_recommend_move_returns_none_when_forced_to_pass() -> None:
     state = GameState(table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)})
     knowledge = PlayerKnowledge(player=0, hand=hand("AH 2H 3H 4H 9H 10H"))
@@ -212,26 +235,6 @@ def test_validate_turn_rejects_non_opening_card_on_empty_table() -> None:
         assert "cannot play" in str(error)
     else:
         raise AssertionError("expected illegal first move to raise ValueError")
-
-
-def test_endgame_urgency_has_gradient_for_known_counts() -> None:
-    calm = GameState(hand_counts=(8, 7, 9, 10))
-    close_race = GameState(hand_counts=(4, 1, 9, 10))
-
-    assert endgame_urgency(calm, 0) == 0.0
-    assert endgame_urgency(close_race, 0) > endgame_urgency(calm, 0)
-
-
-def test_endgame_urgency_is_not_an_active_score_component() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(3, 2, 8, 9),
-    )
-    knowledge = PlayerKnowledge(player=0, hand=hand("6H 8H AS KS"))
-
-    result = score_move(state, knowledge, Card(Suit.HEARTS, 6))
-
-    assert "endgame_urgency" not in result.components
 
 
 def test_earlier_side_card_releases_more_future_chain_than_later_side_card() -> None:
@@ -566,6 +569,142 @@ def test_rollout_information_limited_completes_without_hidden_hand_leakage() -> 
     assert not result.timed_out
 
 
+def test_mask_hand_helpers_match_set_helpers() -> None:
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H")),
+        2: set(),
+        3: set(hand("7S 7C")),
+    }
+
+    hand_masks = hand_masks_from_hands(hands)
+
+    assert mask_hand_count_tuple(hand_masks) == hand_count_tuple(hands)
+    assert first_empty_player_mask(hand_masks) == 2
+    assert set(mask_to_cards(hand_masks[0])) == hands[0]
+
+
+def test_mask_after_play_matches_apply_known_play_hands() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H")),
+        2: set(hand("7S")),
+        3: set(hand("7C")),
+    }
+
+    _, next_hands = apply_known_play(state, hands, 0, Card(Suit.HEARTS, 6))
+    next_masks = mask_after_play(hand_masks_from_hands(hands), 0, Card(Suit.HEARTS, 6))
+
+    assert next_masks == hand_masks_from_hands(next_hands)
+
+
+def test_mask_after_play_rejects_card_not_in_hand() -> None:
+    masks = hand_masks_from_hands(
+        {
+            0: set(hand("8H")),
+            1: set(hand("5H")),
+            2: set(hand("7S")),
+            3: set(hand("7C")),
+        }
+    )
+
+    try:
+        mask_after_play(masks, 0, Card(Suit.HEARTS, 6))
+    except ValueError as error:
+        assert "not in hand mask" in str(error)
+    else:
+        raise AssertionError("expected missing-card mask play to raise ValueError")
+
+
+def test_choose_information_limited_move_from_mask_matches_set_path() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 2, 1, 1),
+        current_player=0,
+    )
+    player_hand = hand("6H 8H")
+    deck = frozenset(hand("6H 8H 5H 9H 7S 7C")) | {Card(Suit.HEARTS, 7)}
+
+    set_choice = choose_information_limited_move(state, player_hand, 0, deck=deck)
+    cache = BoundedInformationLimitedPolicyCache()
+    mask_choice = choose_information_limited_move_from_mask(
+        state,
+        card_set_mask(player_hand),
+        0,
+        deck_mask=card_set_mask(deck),
+        cache=cache,
+    )
+
+    assert mask_choice == set_choice
+    assert len(cache) == 1
+
+
+def test_rollout_information_limited_masks_matches_set_rollout() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 2, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H 9H")),
+        2: set(hand("7S")),
+        3: set(hand("7C")),
+    }
+    deck = frozenset(card for cards in hands.values() for card in cards) | {Card(Suit.HEARTS, 7)}
+
+    set_result = rollout_information_limited(state, hands, max_turns=10, rng=random.Random(11))
+    mask_result = rollout_information_limited_masks(
+        state,
+        hand_masks_from_hands(hands),
+        max_turns=10,
+        rng=random.Random(11),
+        deck=deck,
+    )
+
+    assert mask_result == set_result
+
+
+def test_rollout_information_limited_masks_softmax_matches_set_rollout() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 2, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H 9H")),
+        2: set(hand("7S")),
+        3: set(hand("7C")),
+    }
+    deck = frozenset(card for cards in hands.values() for card in cards) | {Card(Suit.HEARTS, 7)}
+
+    set_result = rollout_information_limited(
+        state,
+        hands,
+        max_turns=10,
+        rng=random.Random(11),
+        policy="softmax",
+        rationality=0.5,
+    )
+    mask_result = rollout_information_limited_masks(
+        state,
+        hand_masks_from_hands(hands),
+        max_turns=10,
+        rng=random.Random(11),
+        deck=deck,
+        policy="softmax",
+        rationality=0.5,
+    )
+
+    assert mask_result == set_result
+
+
 def test_rollout_information_limited_transposition_cache_preserves_result() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -688,9 +827,18 @@ def test_information_limited_monte_carlo_shared_policy_cache_preserves_result() 
         rng=random.Random(12),
         policy_cache=shared_cache,
     )
+    fully_cached = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=4,
+        max_turns=20,
+        rng=random.Random(12),
+        policy_cache=BoundedInformationLimitedPolicyCache(),
+        rollout_cache=BoundedRolloutTranspositionCache(),
+    )
 
     assert cached == uncached
-    assert len(shared_cache) > 0
+    assert fully_cached == uncached
 
 
 def test_information_limited_monte_carlo_accepts_legacy_greedy_alias() -> None:
@@ -811,6 +959,99 @@ def test_recommend_move_information_limited_monte_carlo_shortcuts_immediate_win(
     assert result.win_rate == 1.0
     assert result.average_finish_margin == 2.0
     assert result.policy_name == "information_limited_heuristic_greedy_immediate_win"
+
+
+def test_perfect_information_counterpart_oracle_uses_true_deal_without_hidden_sampling() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    first_world = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H")),
+        2: set(hand("9H")),
+        3: set(hand("7S")),
+    }
+    second_world = {
+        0: set(hand("6H 8H")),
+        1: set(hand("9H")),
+        2: set(hand("5H")),
+        3: set(hand("7S")),
+    }
+
+    first_score = evaluate_move_perfect_information_rollout_ev(
+        state,
+        first_world,
+        0,
+        Card(Suit.HEARTS, 6),
+        max_turns=1,
+        rng=random.Random(21),
+    )
+    second_score = evaluate_move_perfect_information_rollout_ev(
+        state,
+        second_world,
+        0,
+        Card(Suit.HEARTS, 6),
+        max_turns=1,
+        rng=random.Random(21),
+    )
+
+    assert first_score.samples == 1
+    assert second_score.samples == 1
+    assert first_score.policy_name == "perfect_information_counterpart_information_limited_heuristic_greedy"
+    assert first_score.score != second_score.score
+
+
+def test_recommend_move_perfect_information_counterpart_returns_labeled_legal_move() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H")),
+        2: set(hand("9H")),
+        3: set(hand("7S")),
+    }
+
+    result = recommend_move_perfect_information_rollout_ev(
+        state,
+        hands,
+        0,
+        max_turns=20,
+        rng=random.Random(22),
+    )
+
+    assert result is not None
+    assert result.card in state.legal_moves(hands[0])
+    assert result.samples == 1
+    assert result.policy_name == "perfect_information_counterpart_information_limited_heuristic_greedy"
+
+
+def test_full_game_agent_can_use_perfect_information_counterpart_oracle_policy() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    hands = {
+        0: set(hand("6H 8H")),
+        1: set(hand("5H")),
+        2: set(hand("9H")),
+        3: set(hand("7S")),
+    }
+
+    card = choose_full_game_agent_move(
+        state,
+        hands,
+        0,
+        FullGameAgent("CounterpartOracle", "perfect_information_counterpart_oracle"),
+        random.Random(23),
+    )
+
+    assert card in state.legal_moves(hands[0])
 
 
 def test_evaluate_move_information_limited_monte_carlo_supports_softmax_policy() -> None:
@@ -983,7 +1224,7 @@ def test_full_game_to_completion_reports_final_ranks_and_cards_left() -> None:
 
 def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
     agents = (
-        FullGameAgent("Ours", "heuristic"),
+        FullGameAgent("Monte Carlo", "heuristic"),
         FullGameAgent("Random", "random"),
         FullGameAgent("Greedy", "greedy_furthest_from_seven"),
         FullGameAgent("Heuristic", "heuristic"),
@@ -1000,7 +1241,7 @@ def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
     assert evaluation.deals == 2
     assert evaluation.rotations_per_deal == 4
     assert {summary.agent_name for summary in evaluation.agent_summaries} == {
-        "Ours",
+        "Monte Carlo",
         "Random",
         "Greedy",
         "Heuristic",
@@ -1017,7 +1258,7 @@ def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
 
 def test_duplicate_deal_evaluation_reports_progress() -> None:
     agents = (
-        FullGameAgent("Ours", "heuristic"),
+        FullGameAgent("Monte Carlo", "heuristic"),
         FullGameAgent("Random", "random"),
         FullGameAgent("Greedy", "greedy_furthest_from_seven"),
         FullGameAgent("Heuristic", "heuristic"),
@@ -1044,7 +1285,7 @@ def test_duplicate_deal_evaluation_reports_progress() -> None:
 
 def test_duplicate_deal_evaluation_records_deterministic_game_results() -> None:
     agents = (
-        FullGameAgent("Ours", "heuristic"),
+        FullGameAgent("Monte Carlo", "heuristic"),
         FullGameAgent("Random", "random"),
         FullGameAgent("Greedy", "greedy_furthest_from_seven"),
         FullGameAgent("Heuristic", "heuristic"),
@@ -1093,7 +1334,7 @@ def test_full_game_eval_report_runs_are_unique_and_parameterized() -> None:
 
         agents = (
             FullGameAgent(
-                "Ours",
+                "Monte Carlo",
                 "information_limited_monte_carlo",
                 samples_per_move=5,
                 rollout_max_turns=30,
@@ -1130,13 +1371,13 @@ def test_full_game_eval_report_runs_are_unique_and_parameterized() -> None:
         assert json_path.exists()
         assert "eval_args.samples_per_move,5" in run_csv_path.read_text(encoding="utf-8")
         agent_csv = agent_csv_path.read_text(encoding="utf-8")
-        assert "Ours,information_limited_monte_carlo,heuristic_weights.self_unlock,4.0" in agent_csv
+        assert "Monte Carlo,information_limited_monte_carlo,heuristic_weights.self_unlock,4.0" in agent_csv
         assert "Random,random,heuristic_weights.self_unlock" not in agent_csv
 
 
 def test_duplicate_deal_evaluation_supports_reduced_decks() -> None:
     agents = (
-        FullGameAgent("Ours", "information_limited_monte_carlo", samples_per_move=1, rollout_max_turns=20),
+        FullGameAgent("Monte Carlo", "information_limited_monte_carlo", samples_per_move=1, rollout_max_turns=20),
         FullGameAgent("Random", "random"),
         FullGameAgent("Greedy", "greedy_furthest_from_seven"),
         FullGameAgent("Heuristic", "heuristic"),
@@ -1153,6 +1394,46 @@ def test_duplicate_deal_evaluation_supports_reduced_decks() -> None:
     assert evaluation.games == 4
     assert evaluation.timeout_rate == 0.0
     assert all(summary.average_cards_left <= 5 for summary in evaluation.agent_summaries)
+
+
+def test_duplicate_deal_evaluation_can_trace_mc_heuristic_decisions() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from full_game_eval import write_mc_heuristic_decisions_csv
+
+    agents = (
+        FullGameAgent("Monte Carlo", "information_limited_monte_carlo", samples_per_move=1, rollout_max_turns=20),
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+
+    evaluation = evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=1,
+        rng=random.Random(18),
+        max_turns=200,
+        cards_per_suit=5,
+        trace_mc_heuristic=True,
+    )
+    traces = [
+        trace
+        for game_result in evaluation.game_results
+        for trace in game_result.result.decision_traces
+    ]
+
+    assert traces
+    assert all(trace.agent_name == "Monte Carlo" for trace in traces)
+    assert all(trace.final_rank is not None for trace in traces)
+    assert all(trace.final_cards_left is not None for trace in traces)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        csv_path = write_mc_heuristic_decisions_csv(evaluation, Path(temp_dir))
+        csv_text = csv_path.read_text(encoding="utf-8")
+
+    assert "disagreed,heuristic_card,mc_card" in csv_text
+    assert "Monte Carlo" in csv_text
 
 
 def test_opponent_model_reports_impossible_known_counts() -> None:

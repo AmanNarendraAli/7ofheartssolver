@@ -108,7 +108,7 @@ Implemented:
   GreedyFurthestFromSeven, Heuristic, and belief-state sampled EV agents
 - paired card advantage summaries and CSV reports through `full_game_eval.py`
 - `full_game_eval.py` progress reporting through `--progress-every`, plus
-  `--fast` mode that uses heuristic `Ours` for quick harness checks without
+  `--fast` mode that uses heuristic `Monte Carlo` for quick harness checks without
   Monte Carlo-in-the-loop cost
 - deterministic per-game seeds and `--workers` multiprocessing for independent
   duplicate-deal rotation games, with results sorted back into deal/rotation
@@ -119,6 +119,12 @@ Implemented:
 - detailed per-rotation `games.csv` report output with seeds, seat agents,
   winners, ranks, cards left, turns, and timeout flags; run-level and active
   per-agent hyperparameters are logged alongside the outcome CSVs
+- optional MC-vs-heuristic decision tracing with
+  `full_game_eval.py --trace-mc-heuristic`; when enabled, each run also writes
+  `mc_heuristic_decisions.csv` with one row per comparable `Monte Carlo`
+  decision, including legal moves, hand/table context, heuristic choice and
+  reasons, Monte Carlo score/win-rate/margin/sample count, disagreement flag,
+  and the final rank/cards-left outcome for that seat
 - reduced-deck full-game evaluation through `--cards-per-suit`, using a rank
   window centered on 7, so `--cards-per-suit 5` runs ranks 5 through 9 in each
   suit while preserving the normal table/turn rules
@@ -133,11 +139,19 @@ Implemented:
 - information-limited rollout through `rollout_information_limited(...)`, where
   each simulated player chooses from only their own private hand plus public
   table/history/count evidence
+- mask-backed information-limited rollout through
+  `rollout_information_limited_masks(...)`, including compact hand-mask
+  updates, mask-based winner/count checks, mask-native policy choice fast paths,
+  and Monte Carlo evaluation over completed hidden-deal masks
 - `recommend_move_information_limited_monte_carlo(...)`, comparing legal moves
   over shared hidden-deal samples under a documented information-limited policy
 - deterministic heuristic-greedy and softmax information-limited heuristic policies
 - exact hidden-deal EV against the declared deterministic information-limited
   heuristic-greedy policy through `recommend_move_exact_information_limited_policy(...)`
+- perfect-information counterpart rollout-EV oracle through
+  `recommend_move_perfect_information_rollout_ev(...)`, mirroring the practical
+  candidate-EV comparison shape while using the true full deal instead of
+  hidden-deal sampling
 - hidden-deal enumeration regression tests for pass constraints, known hand
   counts, and impossible constraint/count combinations
 - regression coverage that non-exhaustive exact recommendation reuses the same
@@ -154,6 +168,9 @@ Implemented:
 - regression coverage that information-limited rollout does not expose hidden
   hands to the acting player's move policy, labels the continuation policy, and
   supports both greedy and softmax policy variants
+- regression coverage that mask hand helpers match set helpers, mask after-play
+  matches set after-play, and mask rollouts match set rollouts for deterministic
+  heuristic-greedy and fixed-seed softmax scenarios
 - regression coverage for exact reduced-state EV against the deterministic
   information-limited heuristic-greedy policy
 - dead/redundant helper cleanup in `seven_hearts.py`: removed the obsolete
@@ -165,7 +182,7 @@ Current verification:
 
 ```text
 py run_tests.py
-88 tests passed
+108 tests passed
 
 py proof_demo.py
 
@@ -181,7 +198,11 @@ py full_game_eval.py --deals 2 --fast --progress-every 2 --max-turns 500
 
 py full_game_eval.py --deals 2 --cards-per-suit 5 --samples-per-move 4 --rollout-max-turns 40 --progress-every 2 --max-turns 200
 
+py full_game_eval.py --deals 1 --cards-per-suit 5 --samples-per-move 1 --rollout-max-turns 20 --max-turns 200 --oracle-gap --progress-every 0
+
 py full_game_eval.py --deals 8 --cards-per-suit 8 --samples-per-move 4 --rollout-max-turns 80 --workers 4 --progress-every 4
+
+py full_game_eval.py --deals 25 --cards-per-suit 5 --samples-per-move 16 --rollout-max-turns 40 --max-turns 200 --trace-mc-heuristic
 
 py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py full_game_eval.py demo.py simulator.py
 ```
@@ -227,6 +248,9 @@ Done in the current proof pass:
    reduced-state EV path.
 3. Kept the core implementation lean by removing redundant/dead helpers after
    the bitmask and reusable hidden-deal sampler paths became canonical.
+4. Moved information-limited Monte Carlo rollout evaluation onto completed
+   hand masks and a mask-native rollout path while preserving the set-based
+   rollout for parity/debugging.
 
 Highest-priority solver/proof work left:
 
@@ -237,8 +261,10 @@ Highest-priority solver/proof work left:
    first target 100k-state reduced positions, then test whether larger
    500k/million-state cases are practical with explicit runtime limits and
    progress reporting.
-3. Continue extending bitmask representation into deeper simulation/search
-   paths, especially rollout hand updates and information-limited policy caches.
+3. Continue reducing remaining allocation in the practical solver, especially
+   the `score_move(...)`/`build_opponent_model(...)` path that still
+   materializes `PlayerKnowledge` and set-oriented opponent models for
+   multi-legal policy decisions.
 4. Add deeper hidden-deal enumeration regression tests around multi-pass
    histories.
 5. Add more hand-authored imperfect-information snapshots with 3-5 cards per
@@ -679,17 +705,17 @@ because it sees hidden hands. But it is a cleaner comparison than the current
 greedy oracle: it asks how much performance is lost because our agent must
 reason from a belief state instead of the actual deal.
 
-Implementation priority:
+Implemented path:
 
 1. Keep the current `rollout_oracle(...)` / `choose_oracle_move(...)` path as a
    legacy greedy full-information diagnostic.
-2. Add a new perfect-information rollout-EV oracle that mirrors the candidate
+2. Use the perfect-information rollout-EV oracle that mirrors the candidate
    comparison shape of `recommend_move_information_limited_monte_carlo(...)`,
    but uses the true full deal directly rather than sampling hidden deals.
 3. Use exact full-information solving for this oracle only on reduced states
    where exhaustive search is tractable; use rollout evaluation for full games.
-4. Report oracle gap against this new counterpart oracle in full-game
-   evaluation.
+4. Report oracle gap against this counterpart oracle in full-game evaluation
+   with `full_game_eval.py --oracle-gap`.
 
 ### True Imperfect-Information Target
 
@@ -1386,6 +1412,9 @@ Phase 1 focuses on using compute better without changing choices:
 - implemented: progress reporting plus complete per-run report directories,
   including `games.csv` for per-rotation auditability and metadata/parameter
   CSVs for eval args, Monte Carlo settings, and heuristic weights
+- implemented: optional `--trace-mc-heuristic` decision-level audit output,
+  which does not change `FullMC` decisions but records where the Monte Carlo
+  policy agrees or disagrees with the same-position heuristic policy
 - supported: reduced-deck tiers, such as `--cards-per-suit 8`, as explicitly
   labeled clean evaluation tiers before scaling to full-deck games
 
@@ -1404,9 +1433,13 @@ cost:
 - implemented: add a rollout transposition cache for deterministic continuation policies,
   keyed by compact public table/history state, current player, hand masks, hand
   counts, deck, weights, policy settings, and remaining rollout budget
-- reduce repeated `GameState`, `PlayerKnowledge`, opponent-model, and set-copy
-  churn inside rollouts
-- extend bitmask hand/table updates deeper into information-limited rollouts
+- implemented: add mask hand helpers and a mask-native
+  `rollout_information_limited_masks(...)` path using compact hand updates,
+  mask-based terminal/count checks, and mask-aware transposition cache keys
+- implemented: wire information-limited Monte Carlo evaluation to complete
+  hidden deals as hand masks and call the mask rollout path
+- remaining: reduce repeated `PlayerKnowledge` and opponent-model materialization
+  in multi-legal policy scoring
 - add a conservative forced-chain win detector only if the win is provable from
   public state plus the actor's known hand; false negatives are acceptable, but
   false positives would invalidate the clean evaluation
@@ -1600,15 +1633,15 @@ The initial evaluation agents are:
 - `GreedyFurthestFromSeven`: choose the legal card with maximum
   `abs(rank - 7)`, using deterministic card order to break ties.
 - `Heuristic`: choose the highest one-ply `score_move(...)` result.
-- `Ours`: the belief-state sampled EV agent, using shared hidden deals and a
+- `Monte Carlo`: the belief-state sampled EV agent, using shared hidden deals and a
   documented information-limited continuation policy.
 - `Oracle`: a full-information reference that may see sampled true hands during
   continuation. For final evaluation, this should be the perfect-information
-  counterpart of `Ours`: same candidate-EV comparison shape, but with the true
+  counterpart of `Monte Carlo`: same candidate-EV comparison shape, but with the true
   deal known instead of a sampled belief state. It is an upper-bound diagnostic,
   not a fair production agent.
 
-`Ours` should not be described as a true optimal imperfect-information solver.
+`Monte Carlo` should not be described as a true optimal imperfect-information solver.
 That stronger claim requires explicit information sets, belief updates inside
 the recurrence or equilibrium method, and a documented multiplayer hidden-
 information solution concept. The current claim is practical and narrower:
@@ -1647,21 +1680,21 @@ The first practical benchmark suite should contain:
 1. Basic mixed table:
 
 ```text
-Ours vs Random vs GreedyFurthestFromSeven vs Heuristic
+Monte Carlo vs Random vs GreedyFurthestFromSeven vs Heuristic
 ```
 
 2. Fixed opponent pools:
 
 ```text
-Ours vs Random x3
-Ours vs GreedyFurthestFromSeven x3
-Ours vs Heuristic x3
+Monte Carlo vs Random x3
+Monte Carlo vs GreedyFurthestFromSeven x3
+Monte Carlo vs Heuristic x3
 ```
 
 3. Strong mixed table:
 
 ```text
-Ours vs GreedyFurthestFromSeven vs Heuristic vs the strongest non-oracle rollout baseline
+Monte Carlo vs GreedyFurthestFromSeven vs Heuristic vs the strongest non-oracle rollout baseline
 ```
 
 4. Paired card advantage against each non-oracle baseline.
@@ -1696,10 +1729,10 @@ Implemented now:
 - duplicate-deal, cyclic seat-rotated benchmark harness
 - paired card advantage tables with standard errors
 - `GreedyFurthestFromSeven` full-game baseline
+- perfect-information counterpart oracle for oracle-gap evaluation
 
 Not implemented yet:
 
-- perfect-information counterpart oracle for oracle-gap evaluation
 - true reduced-deck imperfect-information optimal solver with explicit
   information sets and belief updates
 - 1,000-deal practical benchmark run

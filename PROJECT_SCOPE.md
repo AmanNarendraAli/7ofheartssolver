@@ -68,17 +68,23 @@ The project currently has:
 - constrained hidden-deal sampling and enumeration
 - information-limited rollout and Monte Carlo recommendation over shared hidden
   deals
+- mask-backed information-limited Monte Carlo rollouts, including mask hand
+  updates, winner/count checks, and mask-native policy choice fast paths
 - exact reduced-state EV against declared information-limited policies
+- a perfect-information counterpart oracle for oracle-gap evaluation
 - exact full-information and fixed-policy proof oracles for small or late-game
   complete-hand states
 - proof certificates and benchmark/report scripts for reduced validation cases
 - full-game duplicate-deal, seat-rotated evaluation through `full_game_eval.py`
 - per-run report directories with outcome CSVs and run/agent parameter metadata
+- optional MC-vs-heuristic decision tracing through
+  `full_game_eval.py --trace-mc-heuristic`, written as
+  `mc_heuristic_decisions.csv` in the run report directory
 - a no-dependency test runner in `run_tests.py`
 
-The main practical agent, `Ours`, is best described as a belief-state sampled
-first-out EV agent under a declared information-limited continuation policy. It
-is not claimed to be a true optimal imperfect-information solver.
+The main practical agent, `Monte Carlo`, is best described as a belief-state
+sampled first-out EV agent under a declared information-limited continuation
+policy. It is not claimed to be a true optimal imperfect-information solver.
 
 ## Evaluation
 
@@ -96,20 +102,26 @@ parameters. The current default comparison table uses:
 - `Random`
 - `GreedyFurthestFromSeven`
 - `Heuristic`
-- `Ours`
+- `Monte Carlo`
 
-`--fast` keeps the agent name `Ours` but uses the heuristic policy for cheap
-smoke tests.
+`--fast` keeps the agent name `Monte Carlo` but uses the heuristic policy for
+cheap smoke tests.
+
+`--trace-mc-heuristic` keeps the evaluation policy unchanged, but when
+`Monte Carlo` is using information-limited Monte Carlo it records the
+same-position heuristic choice beside the actual Monte Carlo choice. The resulting
+`mc_heuristic_decisions.csv` is for diagnosing disagreement rate, MC confidence,
+heuristic reasons, and eventual outcome on those decision points.
 
 ## Roadmap
 
 Important remaining work:
 
 - run larger practical benchmark suites and report stronger confidence intervals
-- build the perfect-information counterpart oracle for oracle-gap analysis
+- use the perfect-information counterpart oracle for oracle-gap analysis
 - continue validating information-limited policies on reduced proof cases
-- improve Monte Carlo and rollout performance without changing the declared
-  clean evaluation policy
+- improve remaining Monte Carlo scoring performance without changing the
+  declared clean evaluation policy
 - add automated weight search over shared-deal objective surfaces
 - keep true imperfect-information equilibrium methods as future reduced-deck
   research rather than the immediate production engine
@@ -126,4 +138,8 @@ py proof_eval.py
 py full_game_eval.py
 py full_game_eval.py --fast
 py full_game_eval.py --deals 2 --cards-per-suit 5 --samples-per-move 4 --rollout-max-turns 40 --progress-every 2 --max-turns 200
+py full_game_eval.py --deals 1 --cards-per-suit 5 --samples-per-move 1 --rollout-max-turns 20 --max-turns 200 --oracle-gap --progress-every 0
+py full_game_eval.py --deals 25 --cards-per-suit 5 --samples-per-move 16 --rollout-max-turns 40 --max-turns 200 --trace-mc-heuristic
+
+NEVER use pytest for anything.
 ```

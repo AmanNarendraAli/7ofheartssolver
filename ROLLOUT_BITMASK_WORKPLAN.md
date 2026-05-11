@@ -27,15 +27,22 @@ Already implemented:
 - information-limited heuristic-greedy policy cache keys using actor hand masks and deck
   masks
 - immediate-win shortcut before Monte Carlo sampling
+- mask hand helpers: `hand_masks_from_hands`, `mask_hand_count_tuple`,
+  `first_empty_player_mask`, `mask_after_play`, and `complete_hand_masks`
+- mask-native information-limited rollout through
+  `rollout_information_limited_masks(...)`
+- mask-native policy chooser fast paths through
+  `choose_information_limited_move_from_mask(...)`
+- information-limited Monte Carlo evaluation now completes sampled hidden deals
+  to hand masks and calls the mask rollout path
 
 Still set-heavy:
 
-- `complete_hands(...)` materializes `dict[int, set[Card]]`
-- `rollout_information_limited(...)` copies all hands as sets
-- `apply_known_play(...)` removes cards from sets and rebuilds hand counts
-- `first_empty_player(...)` and `hand_count_tuple(...)` inspect sets
-- `choose_information_limited_move(...)` accepts iterable hands, converts to a
-  `frozenset`, then converts to a mask
+- the legacy public/debug rollout path `rollout_information_limited(...)` still
+  copies all hands as sets
+- set-based helpers such as `complete_hands(...)`, `apply_known_play(...)`,
+  `first_empty_player(...)`, and `hand_count_tuple(...)` remain for oracle,
+  full-game, parity, and debugging paths
 - `score_move(...)` and `build_opponent_model(...)` still expect
   `PlayerKnowledge` with `frozenset[Card]`
 
@@ -229,6 +236,8 @@ independently before combining them.
 
 ## C1: Add Mask-Hand Helpers
 
+Status: implemented.
+
 Introduce small helpers without changing the rollout path yet.
 
 Proposed helpers:
@@ -251,6 +260,8 @@ Acceptance:
 - no behavior change in existing rollout code
 
 ## C2: Mask-Based Rollout Skeleton
+
+Status: implemented as `rollout_information_limited_masks(...)`.
 
 Add a new private/internal rollout path, for example
 `rollout_information_limited_masks(...)`, that mirrors
@@ -278,6 +289,8 @@ Acceptance:
 
 ## C3: Mask-Aware Policy Choice
 
+Status: implemented as `choose_information_limited_move_from_mask(...)`.
+
 Add a mask-native variant of the policy chooser, for example
 `choose_information_limited_move_from_mask(...)`.
 
@@ -296,6 +309,8 @@ Acceptance:
 - no cache-key weakening
 
 ## C4: Wire Mask Rollout Into Monte Carlo Evaluation
+
+Status: implemented for information-limited Monte Carlo evaluation.
 
 Change only the information-limited Monte Carlo path to use the mask rollout
 after C2 and C3 pass.
@@ -321,6 +336,11 @@ Acceptance:
 - benchmark from Phase 0 shows no correctness drift and reports speed delta
 
 ## C5: Remove Remaining Avoidable Set Churn
+
+Status: partially implemented. The information-limited Monte Carlo path now
+uses completed hand masks and the mask rollout, but scoring still materializes
+`PlayerKnowledge` for multi-legal policy decisions because `score_move(...)`
+and `build_opponent_model(...)` remain set-oriented.
 
 Only after the mask rollout is the default for information-limited Monte Carlo:
 

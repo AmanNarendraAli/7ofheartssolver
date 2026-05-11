@@ -1,113 +1,23 @@
+import inspect
+
 import test_seven_hearts
 
 
-TESTS = [
-    test_seven_hearts.test_closed_suit_only_allows_seven,
-    test_seven_hearts.test_after_opening_move_closed_suits_allow_their_sevens,
-    test_seven_hearts.test_open_suit_allows_adjacent_cards,
-    test_seven_hearts.test_player_legal_moves_are_intersection_of_hand_and_table_legal_cards,
-    test_seven_hearts.test_card_bitmask_round_trip_and_legal_move_mask,
-    test_seven_hearts.test_pass_removes_then_legal_cards_from_that_opponent_possibilities,
-    test_seven_hearts.test_opponent_play_removes_card_from_other_opponents_possibilities,
-    test_seven_hearts.test_multi_pass_removes_cards_legal_at_each_pass_moment,
-    test_seven_hearts.test_recommend_move_returns_none_when_forced_to_pass,
-    test_seven_hearts.test_recommend_move_works_without_hand_counts,
-    test_seven_hearts.test_known_player_count_is_decremented_but_unknown_counts_remain_unknown,
-    test_seven_hearts.test_validate_turn_rejects_passing_with_legal_moves,
-    test_seven_hearts.test_validate_turn_rejects_non_opening_card_on_empty_table,
-    test_seven_hearts.test_endgame_urgency_has_gradient_for_known_counts,
-    test_seven_hearts.test_endgame_urgency_is_not_an_active_score_component,
-    test_seven_hearts.test_earlier_side_card_releases_more_future_chain_than_later_side_card,
-    test_seven_hearts.test_opening_seven_is_better_when_it_controls_both_immediate_gates,
-    test_seven_hearts.test_opening_seven_gets_some_credit_for_distant_tail_card,
-    test_seven_hearts.test_tail_bonus_uses_tail_distance_not_average_side_distance,
-    test_seven_hearts.test_future_chain_impact_handles_ace_and_king_edges,
-    test_seven_hearts.test_time_to_playable_counts_required_chain_steps,
-    test_seven_hearts.test_holder_probabilities_sum_to_one_for_possible_unseen_cards,
-    test_seven_hearts.test_known_zero_count_removes_player_from_exact_holder_marginals,
-    test_seven_hearts.test_exact_holder_marginals_obey_pass_constraints_and_known_counts,
-    test_seven_hearts.test_sample_hidden_deal_assigns_every_unseen_card_once,
-    test_seven_hearts.test_sample_hidden_deal_respects_known_counts_and_pass_constraints,
-    test_seven_hearts.test_sample_hidden_deal_returns_none_for_impossible_counts,
-    test_seven_hearts.test_sample_hidden_deals_returns_requested_number_when_possible,
-    test_seven_hearts.test_oracle_rollout_detects_first_player_out,
-    test_seven_hearts.test_oracle_rollout_passes_when_player_has_no_legal_move,
-    test_seven_hearts.test_evaluate_move_monte_carlo_scores_legal_move,
-    test_seven_hearts.test_evaluate_move_monte_carlo_reports_timeouts,
-    test_seven_hearts.test_recommend_move_monte_carlo_returns_legal_move,
-    test_seven_hearts.test_recommend_move_monte_carlo_skips_forced_move_sampling,
-    test_seven_hearts.test_recommend_move_monte_carlo_shortcuts_immediate_win,
-    test_seven_hearts.test_information_limited_policy_uses_only_actor_hand_and_public_state,
-    test_seven_hearts.test_rollout_information_limited_completes_without_hidden_hand_leakage,
-    test_seven_hearts.test_rollout_information_limited_transposition_cache_preserves_result,
-    test_seven_hearts.test_rollout_transposition_cache_key_includes_weights_and_budget,
-    test_seven_hearts.test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_legal_move,
-    test_seven_hearts.test_information_limited_monte_carlo_shared_policy_cache_preserves_result,
-    test_seven_hearts.test_information_limited_monte_carlo_accepts_legacy_greedy_alias,
-    test_seven_hearts.test_information_limited_monte_carlo_softmax_does_not_use_deterministic_caches,
-    test_seven_hearts.test_recommend_move_information_limited_monte_carlo_skips_forced_move_sampling,
-    test_seven_hearts.test_recommend_move_information_limited_monte_carlo_shortcuts_immediate_win,
-    test_seven_hearts.test_evaluate_move_information_limited_monte_carlo_supports_softmax_policy,
-    test_seven_hearts.test_monte_carlo_can_compare_moves_over_shared_hidden_deals,
-    test_seven_hearts.test_oracle_move_score_penalizes_strong_next_response,
-    test_seven_hearts.test_deal_random_hands_deals_full_deck_once,
-    test_seven_hearts.test_reduced_deck_is_centered_on_seven,
-    test_seven_hearts.test_deal_random_hands_supports_reduced_cards_per_suit,
-    test_seven_hearts.test_deal_random_hands_is_seed_reproducible,
-    test_seven_hearts.test_initial_state_starts_with_seven_hearts_holder,
-    test_seven_hearts.test_simulate_complete_game_returns_result,
-    test_seven_hearts.test_estimate_complete_game_metrics_reports_rates,
-    test_seven_hearts.test_full_game_to_completion_reports_final_ranks_and_cards_left,
-    test_seven_hearts.test_duplicate_deal_seat_rotation_reports_paired_card_advantage,
-    test_seven_hearts.test_duplicate_deal_evaluation_reports_progress,
-    test_seven_hearts.test_full_game_eval_report_runs_are_unique_and_parameterized,
-    test_seven_hearts.test_duplicate_deal_evaluation_supports_reduced_decks,
-    test_seven_hearts.test_opponent_model_reports_impossible_known_counts,
-    test_seven_hearts.test_score_components_are_immutable,
-    test_seven_hearts.test_strategy_weights_change_heuristic_score_components,
-    test_seven_hearts.test_strategy_self_play_compares_candidates_on_shared_deals,
-    test_seven_hearts.test_rollout_oracle_can_use_seat_specific_weights,
-    test_seven_hearts.test_full_information_state_enforces_card_conservation_for_declared_deck,
-    test_seven_hearts.test_full_information_exact_solver_picks_immediate_win,
-    test_seven_hearts.test_full_information_exact_solver_follows_forced_pass_chain,
-    test_seven_hearts.test_full_information_solver_reports_deadlock_state,
-    test_seven_hearts.test_full_information_root_forced_pass_has_no_chosen_move,
-    test_seven_hearts.test_forced_pass_chain_canonicalization_preserves_value,
-    test_seven_hearts.test_full_information_exact_solver_avoids_opening_next_player_win,
-    test_seven_hearts.test_full_information_exact_solver_uses_deterministic_tie_breaker,
-    test_seven_hearts.test_full_information_memoized_solver_matches_tiny_brute_force,
-    test_seven_hearts.test_full_information_memoized_solver_matches_random_tiny_brute_force,
-    test_seven_hearts.test_random_full_game_walk_preserves_conservation_and_table_invariants,
-    test_seven_hearts.test_exact_solver_certificate_snapshot_for_rational_proof_position,
-    test_seven_hearts.test_exact_solver_certificate_snapshot_for_fixed_policy_position,
-    test_seven_hearts.test_enumerate_hidden_deals_exhausts_count_consistent_small_belief_set,
-    test_seven_hearts.test_enumerate_hidden_deals_respects_pass_constraints_with_known_counts,
-    test_seven_hearts.test_enumerate_hidden_deals_respects_played_card_ownership_history,
-    test_seven_hearts.test_enumerate_hidden_deals_returns_zero_when_pass_constraints_conflict_with_counts,
-    test_seven_hearts.test_exact_imperfect_information_move_value_is_exact_for_immediate_win,
-    test_seven_hearts.test_exact_information_limited_policy_ev_is_exact_for_immediate_win,
-    test_seven_hearts.test_recommend_move_exact_information_limited_policy_reports_model,
-    test_seven_hearts.test_exact_imperfect_information_certificate_snapshot_for_reduced_belief_position,
-    test_seven_hearts.test_exact_imperfect_information_certificate_snapshot_for_multi_suit_belief_position,
-    test_seven_hearts.test_full_information_from_hands_derives_trailing_public_pass_count,
-    test_seven_hearts.test_exact_imperfect_information_reuses_same_hidden_deal_set_for_all_candidate_moves,
-    test_seven_hearts.test_exact_imperfect_information_uses_vector_tie_breaker,
-    test_seven_hearts.test_recommend_move_exact_imperfect_information_reports_non_exhaustive_limit,
-    test_seven_hearts.test_full_information_fixed_policy_solver_chooses_best_root_response,
-    test_seven_hearts.test_exact_solver_certificate_includes_move_values_and_stats,
-    test_seven_hearts.test_exact_imperfect_information_certificate_reports_exhaustive_status,
-    test_seven_hearts.test_lowest_legal_card_policy_rejects_forced_pass_state,
-    test_seven_hearts.test_proof_benchmark_tiers_include_harder_positions,
-    test_seven_hearts.test_hard_proof_benchmark_reaches_thousand_state_scale,
-    test_seven_hearts.test_proof_eval_reports_engine_regret_against_exact_ev,
-]
+def discover_tests() -> list[tuple[str, object]]:
+    tests = [
+        (name, function)
+        for name, function in vars(test_seven_hearts).items()
+        if name.startswith("test_") and callable(function)
+    ]
+    return sorted(tests, key=lambda item: inspect.getsourcelines(item[1])[1])
 
 
 def main() -> None:
-    for test in TESTS:
+    tests = discover_tests()
+    for name, test in tests:
         test()
-        print(f"PASS {test.__name__}")
-    print(f"\n{len(TESTS)} tests passed")
+        print(f"PASS {name}")
+    print(f"\n{len(tests)} tests passed")
 
 
 if __name__ == "__main__":
