@@ -1,0 +1,31 @@
+# Third-party packages
+flask
+matplotlib
+
+# Python standard library imports used by this project:
+# argparse
+# collections
+# concurrent.futures
+# csv
+# dataclasses
+# datetime
+# enum
+# functools
+# inspect
+# json
+# math
+# os
+# pathlib
+# random
+# sys
+# threading
+# time
+# types
+# typing
+
+# Local project modules:
+# seven_hearts
+# full_game_eval
+# proof_benchmark
+# proof_eval
+# test_seven_hearts
