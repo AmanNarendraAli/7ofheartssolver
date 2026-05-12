@@ -77,6 +77,12 @@ The project currently has:
 - proof certificates and benchmark/report scripts for reduced validation cases
 - full-game duplicate-deal, seat-rotated evaluation through `full_game_eval.py`
 - per-run report directories with outcome CSVs and run/agent parameter metadata
+- per-agent standard errors, paired 95% confidence intervals, decision-volume
+  counts, and oracle-gap columns in the existing full-game summary CSVs
+- random-search tuning harness through `tune_eval.py` for heuristic weights and
+  Monte Carlo run settings on shared duplicate-deal evaluations
+- experiment notebook in `EXPERIMENT_LOG.md` for preserving run questions,
+  commands, seeds, reports, results, and decisions
 - optional MC-vs-heuristic decision tracing through
   `full_game_eval.py --trace-mc-heuristic`, written as
   `mc_heuristic_decisions.csv` in the run report directory
@@ -117,12 +123,12 @@ heuristic reasons, and eventual outcome on those decision points.
 
 Important remaining work:
 
-- run larger practical benchmark suites and report stronger confidence intervals
+- run larger practical benchmark suites using the existing confidence-interval
+  and decision-volume reporting
 - use the perfect-information counterpart oracle for oracle-gap analysis
 - continue validating information-limited policies on reduced proof cases
 - improve remaining Monte Carlo scoring performance without changing the
   declared clean evaluation policy
-- add automated weight search over shared-deal objective surfaces
 - keep true imperfect-information equilibrium methods as future reduced-deck
   research rather than the immediate production engine
 
@@ -140,6 +146,9 @@ py full_game_eval.py --fast
 py full_game_eval.py --deals 2 --cards-per-suit 5 --samples-per-move 4 --rollout-max-turns 40 --progress-every 2 --max-turns 200
 py full_game_eval.py --deals 1 --cards-per-suit 5 --samples-per-move 1 --rollout-max-turns 20 --max-turns 200 --oracle-gap --progress-every 0
 py full_game_eval.py --deals 25 --cards-per-suit 5 --samples-per-move 16 --rollout-max-turns 40 --max-turns 200 --trace-mc-heuristic
+py tune_eval.py --mode heuristic --candidates 16 --deals 100 --workers 4
+
+Before serious tuning/eval runs, add an entry to `EXPERIMENT_LOG.md`.
 
 NEVER use pytest for anything.
 ```

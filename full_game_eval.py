@@ -298,22 +298,62 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
 
     with agents_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
-        writer.writerow(["agent", "seats_played", "win_rate", "average_cards_left", "average_rank"])
+        writer.writerow(
+            [
+                "agent",
+                "seats_played",
+                "win_rate",
+                "win_rate_standard_error",
+                "average_cards_left",
+                "cards_left_standard_error",
+                "average_rank",
+                "rank_standard_error",
+                "turns",
+                "forced_passes",
+                "single_legal_moves",
+                "immediate_wins",
+                "sampled_mc_decisions",
+            ]
+        )
         for summary in evaluation.agent_summaries:
             writer.writerow(
                 [
                     summary.agent_name,
                     summary.seats_played,
                     f"{summary.win_rate:.6f}",
+                    f"{summary.win_rate_standard_error:.6f}",
                     f"{summary.average_cards_left:.6f}",
+                    f"{summary.cards_left_standard_error:.6f}",
                     f"{summary.average_rank:.6f}",
+                    f"{summary.rank_standard_error:.6f}",
+                    summary.turns,
+                    summary.forced_passes,
+                    summary.single_legal_moves,
+                    summary.immediate_wins,
+                    summary.sampled_mc_decisions,
                 ]
             )
 
     with paired_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
-        writer.writerow(["primary_agent", "baseline_agent", "comparisons", "average_advantage", "standard_error"])
+        writer.writerow(
+            [
+                "primary_agent",
+                "baseline_agent",
+                "comparisons",
+                "average_advantage",
+                "standard_error",
+                "ci95_low",
+                "ci95_high",
+                "average_oracle_gap",
+                "oracle_gap_standard_error",
+                "oracle_gap_ci95_low",
+                "oracle_gap_ci95_high",
+            ]
+        )
         for advantage in evaluation.paired_card_advantages:
+            is_oracle_gap = "oracle" in advantage.baseline_agent.lower()
+            oracle_gap = -advantage.average_advantage
             writer.writerow(
                 [
                     advantage.primary_agent,
@@ -321,6 +361,12 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
                     advantage.comparisons,
                     f"{advantage.average_advantage:.6f}",
                     f"{advantage.standard_error:.6f}",
+                    f"{advantage.ci95_low:.6f}",
+                    f"{advantage.ci95_high:.6f}",
+                    f"{oracle_gap:.6f}" if is_oracle_gap else "",
+                    f"{advantage.standard_error:.6f}" if is_oracle_gap else "",
+                    f"{-advantage.ci95_high:.6f}" if is_oracle_gap else "",
+                    f"{-advantage.ci95_low:.6f}" if is_oracle_gap else "",
                 ]
             )
 

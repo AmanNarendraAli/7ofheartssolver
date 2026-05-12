@@ -119,6 +119,17 @@ Implemented:
 - detailed per-rotation `games.csv` report output with seeds, seat agents,
   winners, ranks, cards left, turns, and timeout flags; run-level and active
   per-agent hyperparameters are logged alongside the outcome CSVs
+- `agent_summary.csv` reports per-agent standard errors and decision-volume
+  counts for turns, forced passes, single legal moves, immediate wins, and
+  sampled Monte Carlo decisions
+- `paired_card_advantage.csv` reports standard errors, 95% confidence intervals,
+  and oracle-gap columns when the paired baseline is an oracle agent
+- `tune_eval.py`, a random-search tuning harness for heuristic weights and
+  Monte Carlo run settings, ranking candidates by paired card advantage on
+  shared duplicate-deal evaluations
+- `EXPERIMENT_LOG.md`, a lightweight experiment notebook for recording serious
+  tuning/evaluation questions, commands, seeds, report paths, results, and
+  decisions
 - optional MC-vs-heuristic decision tracing with
   `full_game_eval.py --trace-mc-heuristic`; when enabled, each run also writes
   `mc_heuristic_decisions.csv` with one row per comparable `Monte Carlo`
@@ -182,7 +193,7 @@ Current verification:
 
 ```text
 py run_tests.py
-108 tests passed
+110 tests passed
 
 py proof_demo.py
 
@@ -204,7 +215,11 @@ py full_game_eval.py --deals 8 --cards-per-suit 8 --samples-per-move 4 --rollout
 
 py full_game_eval.py --deals 25 --cards-per-suit 5 --samples-per-move 16 --rollout-max-turns 40 --max-turns 200 --trace-mc-heuristic
 
-py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py full_game_eval.py demo.py simulator.py
+py tune_eval.py --mode heuristic --candidates 16 --deals 100 --workers 4
+
+For serious tuning/evaluation runs, add a dated entry to `EXPERIMENT_LOG.md`.
+
+py -m py_compile seven_hearts.py test_seven_hearts.py run_tests.py proof_demo.py proof_benchmark.py proof_eval.py full_game_eval.py tune_eval.py demo.py simulator.py
 ```
 
 Important current limitations:
@@ -1727,9 +1742,12 @@ Implemented now:
 - full-game evaluator that continues after first-out to final ranks/cards-left
   outcomes
 - duplicate-deal, cyclic seat-rotated benchmark harness
-- paired card advantage tables with standard errors
+- paired card advantage tables with standard errors and 95% confidence intervals
+- per-agent full-game summary standard errors and decision-volume counts
 - `GreedyFurthestFromSeven` full-game baseline
-- perfect-information counterpart oracle for oracle-gap evaluation
+- perfect-information counterpart oracle for oracle-gap evaluation, with oracle
+  gap folded into the paired card advantage report
+- random-search tuning reports for heuristic weights and Monte Carlo settings
 
 Not implemented yet:
 

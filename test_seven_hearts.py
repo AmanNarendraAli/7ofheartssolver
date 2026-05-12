@@ -1247,12 +1247,17 @@ def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
         "Heuristic",
     }
     assert all(summary.seats_played == 8 for summary in evaluation.agent_summaries)
+    assert all(summary.win_rate_standard_error >= 0.0 for summary in evaluation.agent_summaries)
+    assert all(summary.cards_left_standard_error >= 0.0 for summary in evaluation.agent_summaries)
+    assert all(summary.rank_standard_error >= 0.0 for summary in evaluation.agent_summaries)
+    assert all(summary.turns > 0 for summary in evaluation.agent_summaries)
     assert {advantage.baseline_agent for advantage in evaluation.paired_card_advantages} == {
         "Random",
         "Greedy",
         "Heuristic",
     }
     assert all(advantage.comparisons == 8 for advantage in evaluation.paired_card_advantages)
+    assert all(advantage.ci95_low <= advantage.average_advantage <= advantage.ci95_high for advantage in evaluation.paired_card_advantages)
     assert evaluation.average_turns > 0.0
 
 
@@ -1394,6 +1399,84 @@ def test_duplicate_deal_evaluation_supports_reduced_decks() -> None:
     assert evaluation.games == 4
     assert evaluation.timeout_rate == 0.0
     assert all(summary.average_cards_left <= 5 for summary in evaluation.agent_summaries)
+
+
+def test_full_game_eval_summary_csvs_include_big_run_reporting_columns() -> None:
+    import tempfile
+    from pathlib import Path
+
+    from full_game_eval import write_summary_csv
+
+    agents = (
+        FullGameAgent("Monte Carlo", "information_limited_monte_carlo", samples_per_move=1, rollout_max_turns=20),
+        FullGameAgent(
+            "CounterpartOracle",
+            "perfect_information_counterpart_oracle",
+            samples_per_move=1,
+            rollout_max_turns=20,
+        ),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+
+    evaluation = evaluate_duplicate_deal_seat_rotation(
+        agents,
+        deals=1,
+        rng=random.Random(19),
+        max_turns=200,
+        cards_per_suit=5,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        agent_path, paired_path, _ = write_summary_csv(evaluation, Path(temp_dir))
+        agent_csv = agent_path.read_text(encoding="utf-8")
+        paired_csv = paired_path.read_text(encoding="utf-8")
+
+    assert "win_rate_standard_error" in agent_csv
+    assert "cards_left_standard_error" in agent_csv
+    assert "turns,forced_passes,single_legal_moves,immediate_wins,sampled_mc_decisions" in agent_csv
+    assert "ci95_low,ci95_high,average_oracle_gap" in paired_csv
+    assert "CounterpartOracle" in paired_csv
+
+
+def test_tune_eval_random_search_writes_ranked_candidate_reports() -> None:
+    import argparse
+    import tempfile
+    from pathlib import Path
+
+    from tune_eval import parse_int_choices, run_tuning
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        args = argparse.Namespace(
+            mode="heuristic",
+            candidates=2,
+            deals=1,
+            cards_per_suit=5,
+            max_turns=200,
+            seed=23,
+            eval_seed=7,
+            workers=1,
+            output_dir=Path(temp_dir),
+            progress_every=0,
+            samples_per_move=4,
+            rollout_max_turns=20,
+            mc_samples_choices=parse_int_choices("4,8"),
+            mc_rollout_turn_choices=parse_int_choices("20,40"),
+        )
+
+        run_dir, paths = run_tuning(args)
+        summary_path = run_dir / "candidate_summary.csv"
+        parameters_path = run_dir / "candidate_parameters.csv"
+        metadata_path = run_dir / "run_metadata.json"
+
+        assert summary_path in paths
+        assert parameters_path in paths
+        assert metadata_path in paths
+        summary_csv = summary_path.read_text(encoding="utf-8")
+        assert "candidate_id,mode,score" in summary_csv
+        assert "c0000" in summary_csv
+        assert "weights.self_unlock" in parameters_path.read_text(encoding="utf-8")
+        assert '"mode": "heuristic"' in metadata_path.read_text(encoding="utf-8")
 
 
 def test_duplicate_deal_evaluation_can_trace_mc_heuristic_decisions() -> None:

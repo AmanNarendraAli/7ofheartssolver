@@ -936,6 +936,15 @@ class FullGameAgent:
 
 
 @dataclass(frozen=True)
+class FullGameDecisionCounts:
+    turns: int = 0
+    forced_passes: int = 0
+    single_legal_moves: int = 0
+    immediate_wins: int = 0
+    sampled_mc_decisions: int = 0
+
+
+@dataclass(frozen=True)
 class FullGameResult:
     agent_names_by_seat: tuple[str, str, str, str]
     winner: int | None
@@ -945,6 +954,17 @@ class FullGameResult:
     turns_played: int
     timed_out: bool = False
     decision_traces: tuple["DecisionTrace", ...] = ()
+    decision_counts_by_seat: tuple[
+        FullGameDecisionCounts,
+        FullGameDecisionCounts,
+        FullGameDecisionCounts,
+        FullGameDecisionCounts,
+    ] = (
+        FullGameDecisionCounts(),
+        FullGameDecisionCounts(),
+        FullGameDecisionCounts(),
+        FullGameDecisionCounts(),
+    )
 
 
 @dataclass(frozen=True)
@@ -976,8 +996,16 @@ class AgentFullGameSummary:
     agent_name: str
     seats_played: int
     win_rate: float
+    win_rate_standard_error: float
     average_cards_left: float
+    cards_left_standard_error: float
     average_rank: float
+    rank_standard_error: float
+    turns: int = 0
+    forced_passes: int = 0
+    single_legal_moves: int = 0
+    immediate_wins: int = 0
+    sampled_mc_decisions: int = 0
 
 
 @dataclass(frozen=True)
@@ -987,6 +1015,8 @@ class PairedCardAdvantage:
     comparisons: int
     average_advantage: float
     standard_error: float
+    ci95_low: float
+    ci95_high: float
 
 
 @dataclass(frozen=True)
@@ -3027,6 +3057,7 @@ def simulate_full_game_to_completion(
     state = initial_state_for_hands(current_hands)
     finish_order: list[int] = []
     decision_traces: list[DecisionTrace] = []
+    decision_counts = [FullGameDecisionCounts() for _ in range(4)]
     policy_cache: InformationLimitedPolicyCache = BoundedInformationLimitedPolicyCache()
     rollout_cache: RolloutTranspositionCache = BoundedRolloutTranspositionCache()
 
@@ -3042,6 +3073,7 @@ def simulate_full_game_to_completion(
                 turns_played,
                 timed_out=False,
                 decision_traces=decision_traces,
+                decision_counts_by_seat=decision_counts,
             )
         if turns_played == max_turns:
             break
@@ -3053,6 +3085,25 @@ def simulate_full_game_to_completion(
             state = replace_current_player(state, player)
 
         agent = agents_by_seat[player]
+        legal = state.legal_moves(current_hands[player])
+        immediate_win = bool(legal and len(current_hands[player]) == 1)
+        previous_counts = decision_counts[player]
+        decision_counts[player] = FullGameDecisionCounts(
+            turns=previous_counts.turns + 1,
+            forced_passes=previous_counts.forced_passes + (0 if legal else 1),
+            single_legal_moves=previous_counts.single_legal_moves + (1 if len(legal) == 1 else 0),
+            immediate_wins=previous_counts.immediate_wins + (1 if immediate_win else 0),
+            sampled_mc_decisions=previous_counts.sampled_mc_decisions
+            + (
+                1
+                if (
+                    agent.policy == "information_limited_monte_carlo"
+                    and len(legal) > 1
+                    and not immediate_win
+                )
+                else 0
+            ),
+        )
         if (
             trace_mc_heuristic
             and agent.name == DEFAULT_MONTE_CARLO_AGENT_NAME
@@ -3104,6 +3155,7 @@ def simulate_full_game_to_completion(
         max_turns,
         timed_out=True,
         decision_traces=decision_traces,
+        decision_counts_by_seat=decision_counts,
     )
 
 
@@ -3114,6 +3166,12 @@ def finalized_full_game_result(
     turns_played: int,
     timed_out: bool,
     decision_traces: Sequence[DecisionTrace] = (),
+    decision_counts_by_seat: Sequence[FullGameDecisionCounts] = (
+        FullGameDecisionCounts(),
+        FullGameDecisionCounts(),
+        FullGameDecisionCounts(),
+        FullGameDecisionCounts(),
+    ),
 ) -> FullGameResult:
     ranks = [4, 4, 4, 4]
     seen: set[int] = set()
@@ -3164,6 +3222,7 @@ def finalized_full_game_result(
         turns_played=turns_played,
         timed_out=timed_out,
         decision_traces=completed_traces,
+        decision_counts_by_seat=tuple(decision_counts_by_seat),  # type: ignore[arg-type]
     )
 
 
@@ -3222,6 +3281,15 @@ def simulate_duplicate_deal_game_job(job: DuplicateDealGameJob) -> DuplicateDeal
         rotation_index=rotation_index,
     )
     return DuplicateDealGameResult(deal_index, rotation_index, seed, result)
+
+
+def standard_error(values: Sequence[float]) -> float:
+    count = len(values)
+    if count <= 1:
+        return 0.0
+    average = sum(values) / count
+    variance = sum((value - average) ** 2 for value in values) / (count - 1)
+    return sqrt(variance / count)
 
 
 def evaluate_duplicate_deal_seat_rotation(
@@ -3304,6 +3372,7 @@ def summarize_duplicate_deal_results(
     game_results: Sequence[DuplicateDealGameResult] = (),
 ) -> DuplicateDealEvaluation:
     totals: dict[str, dict[str, float]] = {}
+    samples_by_agent: dict[str, dict[str, list[float]]] = {}
     paired: dict[str, list[float]] = {}
     turns_total = 0
     timeouts = 0
@@ -3317,12 +3386,35 @@ def summarize_duplicate_deal_results(
         for seat, agent_name in enumerate(result.agent_names_by_seat):
             bucket = totals.setdefault(
                 agent_name,
-                {"seats": 0.0, "wins": 0.0, "cards_left": 0.0, "rank": 0.0},
+                {
+                    "seats": 0.0,
+                    "wins": 0.0,
+                    "cards_left": 0.0,
+                    "rank": 0.0,
+                    "turns": 0.0,
+                    "forced_passes": 0.0,
+                    "single_legal_moves": 0.0,
+                    "immediate_wins": 0.0,
+                    "sampled_mc_decisions": 0.0,
+                },
             )
+            decision_counts = result.decision_counts_by_seat[seat]
             bucket["seats"] += 1.0
             bucket["wins"] += 1.0 if result.winner == seat else 0.0
             bucket["cards_left"] += result.final_hand_counts[seat]
             bucket["rank"] += result.ranks_by_seat[seat]
+            bucket["turns"] += decision_counts.turns
+            bucket["forced_passes"] += decision_counts.forced_passes
+            bucket["single_legal_moves"] += decision_counts.single_legal_moves
+            bucket["immediate_wins"] += decision_counts.immediate_wins
+            bucket["sampled_mc_decisions"] += decision_counts.sampled_mc_decisions
+            agent_samples = samples_by_agent.setdefault(
+                agent_name,
+                {"wins": [], "cards_left": [], "rank": []},
+            )
+            agent_samples["wins"].append(1.0 if result.winner == seat else 0.0)
+            agent_samples["cards_left"].append(float(result.final_hand_counts[seat]))
+            agent_samples["rank"].append(float(result.ranks_by_seat[seat]))
             if agent_name == primary_agent_name:
                 primary_cards_left = result.final_hand_counts[seat]
 
@@ -3338,13 +3430,22 @@ def summarize_duplicate_deal_results(
         seats = int(bucket["seats"])
         if seats == 0:
             continue
+        samples = samples_by_agent[agent_name]
         summaries.append(
             AgentFullGameSummary(
                 agent_name=agent_name,
                 seats_played=seats,
                 win_rate=bucket["wins"] / seats,
+                win_rate_standard_error=standard_error(samples["wins"]),
                 average_cards_left=bucket["cards_left"] / seats,
+                cards_left_standard_error=standard_error(samples["cards_left"]),
                 average_rank=bucket["rank"] / seats,
+                rank_standard_error=standard_error(samples["rank"]),
+                turns=int(bucket["turns"]),
+                forced_passes=int(bucket["forced_passes"]),
+                single_legal_moves=int(bucket["single_legal_moves"]),
+                immediate_wins=int(bucket["immediate_wins"]),
+                sampled_mc_decisions=int(bucket["sampled_mc_decisions"]),
             )
         )
 
@@ -3354,18 +3455,17 @@ def summarize_duplicate_deal_results(
         if count == 0:
             continue
         average = sum(differences) / count
-        if count > 1:
-            variance = sum((difference - average) ** 2 for difference in differences) / (count - 1)
-            standard_error = sqrt(variance / count)
-        else:
-            standard_error = 0.0
+        standard_error_value = standard_error(differences)
+        ci_radius = 1.96 * standard_error_value
         advantages.append(
             PairedCardAdvantage(
                 primary_agent=primary_agent_name,
                 baseline_agent=baseline,
                 comparisons=count,
                 average_advantage=average,
-                standard_error=standard_error,
+                standard_error=standard_error_value,
+                ci95_low=average - ci_radius,
+                ci95_high=average + ci_radius,
             )
         )
 
