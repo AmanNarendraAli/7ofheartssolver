@@ -157,12 +157,18 @@ Implemented:
 - `recommend_move_information_limited_monte_carlo(...)`, comparing legal moves
   over shared hidden-deal samples under a documented information-limited policy
 - deterministic heuristic-greedy and softmax information-limited heuristic policies
-- exact hidden-deal EV against the declared deterministic information-limited
-  heuristic-greedy policy through `recommend_move_exact_information_limited_policy(...)`
+- hidden-deal EV against the declared deterministic information-limited
+  heuristic-greedy policy through `recommend_move_exact_information_limited_policy(...)`;
+  this is exact over enumerated hidden deals, while terminal-without-timeout
+  continuation remains the next proof-tightening step
 - perfect-information counterpart rollout-EV oracle through
   `recommend_move_perfect_information_rollout_ev(...)`, mirroring the practical
   candidate-EV comparison shape while using the true full deal instead of
   hidden-deal sampling
+- rollout bitmask/cache efficiency plan completed and folded into this proof
+  plan: shared deterministic policy caches, bounded rollout transposition
+  caches, mask hand helpers, mask-native policy fast paths, and mask-backed
+  information-limited Monte Carlo evaluation are implemented
 - hidden-deal enumeration regression tests for pass constraints, known hand
   counts, and impossible constraint/count combinations
 - regression coverage that non-exhaustive exact recommendation reuses the same
@@ -193,7 +199,7 @@ Current verification:
 
 ```text
 py run_tests.py
-110 tests passed
+112 tests passed
 
 py proof_demo.py
 
@@ -257,39 +263,71 @@ Done in the current proof pass:
    moves over shared hidden-deal samples where every simulated player uses only
    their own private hand and public evidence. The implementation includes
    heuristic-greedy and softmax heuristic policies.
-2. Built exact EV against declared information-limited policies for reduced
-   belief states, so the sampled real-game solver has proof-sized validation
-   targets. The deterministic heuristic-greedy information-limited policy has an exact
-   reduced-state EV path.
+2. Built hidden-deal EV against declared information-limited policies for
+   reduced belief states, so the sampled real-game solver has proof-sized
+   validation targets. The deterministic heuristic-greedy information-limited
+   policy is exact over enumerated hidden deals; removing the remaining bounded
+   continuation cutoff is now tracked as a proof-tightening task.
 3. Kept the core implementation lean by removing redundant/dead helpers after
    the bitmask and reusable hidden-deal sampler paths became canonical.
 4. Moved information-limited Monte Carlo rollout evaluation onto completed
    hand masks and a mask-native rollout path while preserving the set-based
    rollout for parity/debugging.
+5. Closed the standalone rollout bitmask workplan as an active implementation
+   plan. Remaining set-oriented scoring and opponent-model allocation is now
+   tracked as general performance work rather than unfinished bitmask plumbing.
 
 Highest-priority solver/proof work left:
 
-1. Treat CFR/perfect-recall and public-belief equilibrium methods as later
+1. Add terminal deterministic information-limited continuations for exact
+   reduced-state EV. For deterministic policies such as heuristic-greedy, each
+   materialized hidden deal should be advanced until a player empties their hand,
+   without an arbitrary `max_turns` cutoff. A full pass cycle with no play should
+   still be detected and reported defensively, even though valid full-deck games
+   should not deadlock before first-out. Exact information-limited certificates
+   should then report terminal outcomes rather than timeout rates.
+2. Retire timeout scoring from exact terminal-continuation paths. The
+   `monte_carlo_timeout_penalty` remains useful only for bounded rollout modes,
+   stochastic softmax diagnostics, or defensive full-game harness limits. It
+   should not affect an exact deterministic information-limited EV claim.
+3. Validate softmax information-limited rollouts as a first-class practical
+   policy option. The default deterministic heuristic-greedy rollout is useful
+   for repeatability and proof-sized comparisons, but it can make opponent
+   continuations too sharp by always choosing one heuristic-best response.
+   Softmax runs should be evaluated as declared policy variants, with
+   rationality, seeds, sample counts, rollout limits, timeout rates, and
+   uncertainty reported so comparisons remain reproducible and statistically
+   valid. Do not silently replace clean deterministic-policy baselines; report
+   greedy and softmax as separate Monte Carlo configurations.
+4. Add a conservative exact-enumeration path for small public belief spaces
+   before falling back to sampled hidden deals. If the complete set of hidden
+   deals can be proven to fit within the configured sample budget or an explicit
+   enumeration cap, evaluate each deal once and share that same deal set across
+   every candidate move. This is not confidence-based early stopping or a
+   heuristic skip: it should preserve the same public belief distribution,
+   remove duplicate with-replacement samples in low-uncertainty endgames, and
+   report whether the deal set was exhaustive or sampled.
+5. Treat CFR/perfect-recall and public-belief equilibrium methods as later
    reduced-deck research, not as the required next step for a usable real-game
    solver.
-2. Extend harder benchmark discovery beyond the current 4k-state hard case:
+6. Extend harder benchmark discovery beyond the current 4k-state hard case:
    first target 100k-state reduced positions, then test whether larger
    500k/million-state cases are practical with explicit runtime limits and
    progress reporting.
-3. Continue reducing remaining allocation in the practical solver, especially
+7. Continue reducing remaining allocation in the practical solver, especially
    the `score_move(...)`/`build_opponent_model(...)` path that still
    materializes `PlayerKnowledge` and set-oriented opponent models for
    multi-legal policy decisions.
-4. Add deeper hidden-deal enumeration regression tests around multi-pass
+8. Add deeper hidden-deal enumeration regression tests around multi-pass
    histories.
-5. Add more hand-authored imperfect-information snapshots with 3-5 cards per
+9. Add more hand-authored imperfect-information snapshots with 3-5 cards per
    opponent and multiple public pass constraints.
-6. Grow `proof_eval.py` into a broader engine scoreboard with more exact
+10. Grow `proof_eval.py` into a broader engine scoreboard with more exact
    positions, repeated Monte Carlo seeds, and trend snapshots.
-7. Tune and validate the practical sampled policies against the exact reduced
+11. Tune and validate the practical sampled policies against the exact reduced
    proof scenarios, especially the current multi-suit case where Monte Carlo
    can pick a regretful move at the default sample count.
-8. Scale duplicate-deal, seat-rotated full-game evaluation runs, using average
+12. Scale duplicate-deal, seat-rotated full-game evaluation runs, using average
    cards left and paired card advantage as the primary practical metrics.
 
 ## Formal Model
@@ -1302,6 +1340,31 @@ for each candidate move:
 This is the immediate next implementation target because it matches the
 real-game use case more closely than full-information continuation search.
 
+For deterministic continuation policies, the proof-sized exact variant should
+not use a rollout cutoff. It should run each materialized hidden deal to a
+terminal first-out outcome:
+
+```text
+for each candidate move:
+  for each hidden deal in the exhaustively enumerated belief set:
+    apply the candidate move in the true hidden deal
+    continue with the declared deterministic information-limited policy
+    stop only when a player empties their hand
+    detect and report a full-pass-cycle deadlock defensively
+  report exact first-out EV and terminal outcome counts
+```
+
+For valid full-deck games, a full pass cycle before first-out should be
+unreachable because some held card must be public-legal until the game has
+advanced. Reduced decks can omit outer cards that the public table would
+normally ask for, so exact reduced-deck tooling should still report a deadlock
+if one appears rather than looping forever.
+
+Once this terminal deterministic path exists, timeout rate and timeout penalties
+are obsolete for exact deterministic information-limited EV. Timeout reporting
+remains appropriate for bounded rollout experiments, stochastic softmax
+rollouts, and full-game harness safety limits.
+
 ### Hidden-Deal Probability
 
 The first exact version should use a clear prior:
@@ -1495,16 +1558,24 @@ Immediate product sequence:
    table/history/count evidence when choosing a move.
 3. Use the existing heuristic scorer as the first deterministic
    information-limited policy.
-4. Add a softmax policy variant with a rationality parameter, so rollouts can
+4. Add a terminal deterministic continuation path for exact reduced-state
+   information-limited EV. It should follow the declared deterministic policy
+   until first-out, detect impossible full-pass-cycle deadlocks defensively, and
+   avoid arbitrary turn cutoffs.
+5. Remove timeout penalties from exact deterministic information-limited EV
+   reporting. Keep timeout fields only for bounded/stochastic rollout modes and
+   harness safety limits.
+6. Add a softmax policy variant with a rationality parameter, so rollouts can
    test random, noisy, and greedy opponents with the same score function.
-5. Add `recommend_move_information_limited_monte_carlo(...)`, comparing legal
+7. Add `recommend_move_information_limited_monte_carlo(...)`, comparing legal
    moves over shared hidden deals and reporting EV, standard error, samples,
-   timeout rate, and policy name.
-6. Build exact reduced-state information-limited EV snapshots to validate the
-   sampled rollout behavior where exhaustive evaluation is tractable.
-7. Expand benchmark discovery toward 100k-state exact-oracle cases and larger
+   timeout rate when the continuation is bounded, and policy name.
+8. Build exact reduced-state information-limited EV snapshots to validate
+   terminal deterministic continuations and sampled rollout behavior where
+   exhaustive evaluation is tractable.
+9. Expand benchmark discovery toward 100k-state exact-oracle cases and larger
    sampled imperfect-information scenarios with explicit runtime limits.
-8. Treat CFR/public-belief equilibrium methods as later research after the
+10. Treat CFR/public-belief equilibrium methods as later research after the
    belief sampler and information-limited rollout engine are strong.
 
 ## Acceptance Criteria
@@ -1541,6 +1612,21 @@ continuation" for a specific position when:
 - the certificate clearly states that players use full-information rational
   continuation after each materialized deal
 
+The project can claim "exact hidden-deal EV under a deterministic
+information-limited policy" for a specific position when:
+
+- every hidden deal consistent with public evidence is enumerated
+- the hidden-deal prior is documented
+- each simulated player chooses only from their own private hand and public
+  evidence under the declared deterministic policy
+- each materialized continuation is run to terminal first-out outcome without an
+  arbitrary `max_turns` cutoff
+- any full-pass-cycle deadlock is reported explicitly as a defensive anomaly
+- each candidate move's expected value is computed from terminal outcome counts
+- the certificate reports hidden deal count, terminal outcome counts, and the
+  declared continuation policy
+- timeout penalties do not affect the exact value
+
 The project should not claim "true imperfect-information optimality" until:
 
 - future players' information sets are modeled explicitly
@@ -1571,8 +1657,9 @@ The project can claim "practical imperfect-information solver" when:
 - candidate moves are compared over the same hidden deals when sampling is used
 - every simulated player acts only from their own private hand and public
   evidence, under a documented information-limited policy
-- the result reports move EV, sample count, uncertainty, timeout rate, and the
-  opponent/self policy used in continuations
+- the result reports move EV, sample count, uncertainty, the opponent/self
+  policy used in continuations, and timeout rate only when the continuation is
+  bounded rather than terminal
 - exact proof-sized information-limited and full-information oracle positions
   are used as regression checks
 - certificates and reports clearly separate exact proof results from sampled

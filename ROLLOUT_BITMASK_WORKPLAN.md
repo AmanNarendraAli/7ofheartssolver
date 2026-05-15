@@ -1,5 +1,22 @@
 # Clean Rollout Efficiency Workplan
 
+Status: closed and folded into `SOLVER_PROOF.md`.
+
+The core rollout bitmask/cache work is complete:
+
+- shared deterministic information-limited policy caches
+- bounded deterministic rollout transposition caches
+- mask hand helpers
+- mask-native information-limited rollout
+- mask-native policy-choice fast paths
+- information-limited Monte Carlo evaluation over completed hidden-deal masks
+
+The remaining set-oriented work, mainly `score_move(...)` and
+`build_opponent_model(...)` materialization during multi-legal policy decisions,
+is now tracked as general performance work in `SOLVER_PROOF.md`, not as
+unfinished bitmask plumbing. This file is retained as an archive of the
+completed implementation sequence and invariants.
+
 This is a focused sub-plan for the next clean-safe efficiency work in
 information-limited Monte Carlo rollouts. It covers the deeper rollout bitmask
 rewrite plus the two highest-value cache optimizations that should preserve the
@@ -14,6 +31,18 @@ the same choices, scores, random behavior, and public-state semantics for clean
 This plan is in scope for clean evaluation only if every phase is
 behavior-preserving. It must not introduce adaptive sample budgets, heuristic
 skips, timeout fallbacks, approximate policies, or exact-solver replacement.
+
+Proof-tightening note:
+
+- For deterministic information-limited policies such as heuristic-greedy, the
+  exact reduced-state EV path should eventually use a terminal continuation that
+  runs each materialized hidden deal until a player empties their hand, with a
+  defensive full-pass-cycle deadlock check instead of an arbitrary rollout
+  cutoff.
+- Once that terminal path exists, `monte_carlo_timeout_penalty` is obsolete for
+  exact deterministic information-limited EV. Timeout fields and penalties
+  remain relevant only for bounded rollout experiments, stochastic softmax
+  diagnostics, and full-game harness safety limits.
 
 ## Current State
 
@@ -69,6 +98,10 @@ Current cache status:
   rules or is a proven immediate win from the actor's known hand.
 
 ## Phase 0: Baseline Measurement
+
+Status: superseded by the existing full-game evaluation and tuning report
+harnesses. A separate microbenchmark script was not required to complete the
+bitmask/cache rollout implementation.
 
 Add a small benchmark script or mode that avoids pytest and reports elapsed time
 for a fixed reduced-deck `FullMC` evaluation.
@@ -337,10 +370,11 @@ Acceptance:
 
 ## C5: Remove Remaining Avoidable Set Churn
 
-Status: partially implemented. The information-limited Monte Carlo path now
-uses completed hand masks and the mask rollout, but scoring still materializes
-`PlayerKnowledge` for multi-legal policy decisions because `score_move(...)`
-and `build_opponent_model(...)` remain set-oriented.
+Status: folded into general performance work in `SOLVER_PROOF.md`. The
+information-limited Monte Carlo path now uses completed hand masks and the mask
+rollout. Further reductions in `PlayerKnowledge`, `score_move(...)`, and
+`build_opponent_model(...)` materialization are useful but are no longer treated
+as unfinished bitmask plumbing.
 
 Only after the mask rollout is the default for information-limited Monte Carlo:
 

@@ -711,6 +711,12 @@ class HiddenDealEnumeration:
     deal_count: int
 
 
+@dataclass(frozen=True)
+class HiddenDealSelection:
+    deals: tuple[HiddenDeal, ...]
+    exhaustive: bool
+
+
 class HiddenDealSampler:
     def __init__(self, state: GameState, knowledge: PlayerKnowledge) -> None:
         self.hidden_cards = tuple(sorted(knowledge.unseen_cards(state)))
@@ -872,6 +878,7 @@ class MonteCarloMoveScore:
     timeout_rate: float = 0.0
     win_rate_standard_error: float = 0.0
     policy_name: str = "oracle_greedy_full_information"
+    exhaustive: bool = False
 
 
 @dataclass(frozen=True)
@@ -1253,6 +1260,22 @@ def sample_hidden_deals(
             break
         deals.append(deal)
     return tuple(deals)
+
+
+def choose_hidden_deals_for_budget(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    max_count: int,
+    rng: random.Random | None = None,
+) -> HiddenDealSelection:
+    if max_count <= 0:
+        return HiddenDealSelection((), False)
+
+    enumeration = enumerate_hidden_deals(state, knowledge, max_deals=max_count + 1)
+    if enumeration.exhaustive:
+        return HiddenDealSelection(enumeration.deals, True)
+
+    return HiddenDealSelection(sample_hidden_deals(state, knowledge, max_count, rng), False)
 
 
 def enumerate_hidden_deals(
@@ -1656,9 +1679,17 @@ def recommend_move_monte_carlo(
         return forced_move_monte_carlo_score(legal[0], "oracle_greedy_full_information_forced_move")
 
     rng = rng or random.Random()
-    hidden_deals = sample_hidden_deals(state, knowledge, samples_per_move, rng)
+    hidden_deal_selection = choose_hidden_deals_for_budget(state, knowledge, samples_per_move, rng)
     results = [
-        evaluate_move_monte_carlo_from_deals(state, knowledge, card, hidden_deals, max_turns, weights)
+        evaluate_move_monte_carlo_from_deals(
+            state,
+            knowledge,
+            card,
+            hidden_deal_selection.deals,
+            max_turns,
+            weights,
+            hidden_deal_selection.exhaustive,
+        )
         for card in legal
     ]
     return max(results, key=lambda result: result.score)
@@ -1733,8 +1764,16 @@ def evaluate_move_monte_carlo(
             "oracle_greedy_full_information_immediate_win",
         )
     rng = rng or random.Random()
-    hidden_deals = sample_hidden_deals(state, knowledge, samples, rng)
-    return evaluate_move_monte_carlo_from_deals(state, knowledge, card, hidden_deals, max_turns, weights)
+    hidden_deal_selection = choose_hidden_deals_for_budget(state, knowledge, samples, rng)
+    return evaluate_move_monte_carlo_from_deals(
+        state,
+        knowledge,
+        card,
+        hidden_deal_selection.deals,
+        max_turns,
+        weights,
+        hidden_deal_selection.exhaustive,
+    )
 
 
 def evaluate_move_monte_carlo_from_deals(
@@ -1744,6 +1783,7 @@ def evaluate_move_monte_carlo_from_deals(
     hidden_deals: Iterable[HiddenDeal],
     max_turns: int = 200,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
+    exhaustive: bool = False,
 ) -> MonteCarloMoveScore:
     if is_immediate_winning_move(state, knowledge, card):
         return terminal_win_monte_carlo_score(
@@ -1776,7 +1816,14 @@ def evaluate_move_monte_carlo_from_deals(
             timeouts += 1
 
     if completed_samples == 0:
-        return MonteCarloMoveScore(card=card, score=float("-inf"), win_rate=0.0, average_finish_margin=0.0, samples=0)
+        return MonteCarloMoveScore(
+            card=card,
+            score=float("-inf"),
+            win_rate=0.0,
+            average_finish_margin=0.0,
+            samples=0,
+            exhaustive=exhaustive,
+        )
 
     win_rate = wins / completed_samples
     average_finish_margin = finish_margin_total / completed_samples
@@ -1798,6 +1845,7 @@ def evaluate_move_monte_carlo_from_deals(
         timeout_rate=timeout_rate,
         win_rate_standard_error=win_rate_standard_error,
         policy_name="oracle_greedy_full_information",
+        exhaustive=exhaustive,
     )
 
 
@@ -1892,7 +1940,7 @@ def recommend_move_information_limited_monte_carlo(
         return forced_move_monte_carlo_score(legal[0], policy_name)
 
     rng = rng or random.Random()
-    hidden_deals = sample_hidden_deals(state, knowledge, samples_per_move, rng)
+    hidden_deal_selection = choose_hidden_deals_for_budget(state, knowledge, samples_per_move, rng)
     decision_policy_cache: InformationLimitedPolicyCache | None = (
         policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None)
     )
@@ -1902,7 +1950,7 @@ def recommend_move_information_limited_monte_carlo(
             state,
             knowledge,
             card,
-            hidden_deals,
+            hidden_deal_selection.deals,
             max_turns,
             weights,
             policy,
@@ -1910,6 +1958,7 @@ def recommend_move_information_limited_monte_carlo(
             rng,
             decision_policy_cache,
             decision_rollout_cache,
+            hidden_deal_selection.exhaustive,
         )
         for card in legal
     ]
@@ -1939,12 +1988,12 @@ def evaluate_move_information_limited_monte_carlo(
             f"{information_limited_policy_name(policy, rationality)}_immediate_win",
         )
     rng = rng or random.Random()
-    hidden_deals = sample_hidden_deals(state, knowledge, samples, rng)
+    hidden_deal_selection = choose_hidden_deals_for_budget(state, knowledge, samples, rng)
     return evaluate_move_information_limited_monte_carlo_from_deals(
         state,
         knowledge,
         card,
-        hidden_deals,
+        hidden_deal_selection.deals,
         max_turns,
         weights,
         policy,
@@ -1952,6 +2001,7 @@ def evaluate_move_information_limited_monte_carlo(
         rng,
         policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None),
         rollout_cache if is_deterministic_heuristic_policy(policy) else None,
+        hidden_deal_selection.exhaustive,
     )
 
 
@@ -1967,6 +2017,7 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
     rng: random.Random | None = None,
     policy_cache: InformationLimitedPolicyCache | None = None,
     rollout_cache: RolloutTranspositionCache | None = None,
+    exhaustive: bool = False,
 ) -> MonteCarloMoveScore:
     policy = normalize_information_limited_policy(policy)
     rng = rng or random.Random()
@@ -2023,6 +2074,7 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
             average_finish_margin=0.0,
             samples=0,
             policy_name=policy_name,
+            exhaustive=exhaustive,
         )
 
     win_rate = wins / completed_samples
@@ -2045,6 +2097,7 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
         timeout_rate=timeout_rate,
         win_rate_standard_error=win_rate_standard_error,
         policy_name=policy_name,
+        exhaustive=exhaustive,
     )
 
 

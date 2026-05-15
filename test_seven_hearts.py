@@ -795,6 +795,56 @@ def test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_l
     assert result.policy_name == "information_limited_heuristic_greedy"
 
 
+def test_information_limited_monte_carlo_enumerates_when_belief_fits_sample_budget() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 0, 0),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=20,
+        max_turns=20,
+        rng=random.Random(12),
+    )
+
+    assert result is not None
+    assert result.samples == 1
+    assert result.exhaustive is True
+
+
+def test_information_limited_monte_carlo_samples_when_belief_exceeds_sample_budget() -> None:
+    state = GameState(
+        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
+        hand_counts=(2, 1, 1, 1),
+        current_player=0,
+    )
+    knowledge = PlayerKnowledge(
+        0,
+        hand("6H 8H"),
+        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
+    )
+
+    result = recommend_move_information_limited_monte_carlo(
+        state,
+        knowledge,
+        samples_per_move=2,
+        max_turns=20,
+        rng=random.Random(12),
+    )
+
+    assert result is not None
+    assert result.samples == 2
+    assert result.exhaustive is False
+
+
 def test_information_limited_monte_carlo_shared_policy_cache_preserves_result() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {
