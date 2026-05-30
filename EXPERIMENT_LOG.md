@@ -56,7 +56,10 @@ Notes:
 
 ```text
 c0000 is the current default StrategyWeights anchor.
-Use candidate_summary.csv for ranking and candidate_parameters.csv to recover weights.
+Use candidate_summary.npz for ranking and candidate_parameters.npz to recover weights.
+Load with numpy, for example:
+  summary = np.load("candidate_summary.npz", allow_pickle=True)
+  params = np.load("candidate_parameters.npz", allow_pickle=True)
 ```
 
 Status:

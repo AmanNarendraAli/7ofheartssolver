@@ -127,6 +127,13 @@ Implemented:
 - `tune_eval.py`, a random-search tuning harness for heuristic weights and
   Monte Carlo run settings, ranking candidates by paired card advantage on
   shared duplicate-deal evaluations
+- tuning runs now write compressed NumPy reports:
+  `candidate_summary.npz`, `candidate_parameters.npz`, and unchanged
+  `run_metadata.json` into each timestamped tuning run directory
+- CHTC cluster handoff files for the large tuning sweep: `tune.def` builds an
+  environment-only Apptainer image, `submit.sh` requests one SLURM task with
+  `--cpus-per-task` workers for plain Python multiprocessing, and `RUN.md`
+  documents build, transfer, sanity-check, and submit steps
 - `EXPERIMENT_LOG.md`, a lightweight experiment notebook for recording serious
   tuning/evaluation questions, commands, seeds, report paths, results, and
   decisions
@@ -222,6 +229,9 @@ py full_game_eval.py --deals 8 --cards-per-suit 8 --samples-per-move 4 --rollout
 py full_game_eval.py --deals 25 --cards-per-suit 5 --samples-per-move 16 --rollout-max-turns 40 --max-turns 200 --trace-mc-heuristic
 
 py tune_eval.py --mode heuristic --candidates 16 --deals 100 --workers 4
+
+For the CHTC tuning sweep, see `RUN.md`; the container intentionally provides
+only the Python environment, and the pulled repo code runs from the host.
 
 For serious tuning/evaluation runs, add a dated entry to `EXPERIMENT_LOG.md`.
 

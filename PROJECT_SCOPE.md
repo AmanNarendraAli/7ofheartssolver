@@ -81,6 +81,12 @@ The project currently has:
   counts, and oracle-gap columns in the existing full-game summary CSVs
 - random-search tuning harness through `tune_eval.py` for heuristic weights and
   Monte Carlo run settings on shared duplicate-deal evaluations
+- compressed NumPy tuning reports from `tune_eval.py`:
+  `candidate_summary.npz`, `candidate_parameters.npz`, and unchanged
+  `run_metadata.json` per timestamped run directory
+- CHTC single-node multiprocessing handoff files: environment-only Apptainer
+  definition in `tune.def`, SLURM submit script in `submit.sh`, and collaborator
+  runbook in `RUN.md`
 - experiment notebook in `EXPERIMENT_LOG.md` for preserving run questions,
   commands, seeds, reports, results, and decisions
 - optional MC-vs-heuristic decision tracing through
@@ -147,6 +153,13 @@ py full_game_eval.py --deals 2 --cards-per-suit 5 --samples-per-move 4 --rollout
 py full_game_eval.py --deals 1 --cards-per-suit 5 --samples-per-move 1 --rollout-max-turns 20 --max-turns 200 --oracle-gap --progress-every 0
 py full_game_eval.py --deals 25 --cards-per-suit 5 --samples-per-move 16 --rollout-max-turns 40 --max-turns 200 --trace-mc-heuristic
 py tune_eval.py --mode heuristic --candidates 16 --deals 100 --workers 4
+
+Cluster tuning handoff:
+
+- build the environment-only image from `tune.def`
+- edit `submit.sh` paths/core count
+- submit with `sbatch submit.sh`
+- follow `RUN.md` for the CHTC runbook
 
 Before serious tuning/eval runs, add an entry to `EXPERIMENT_LOG.md`.
 
