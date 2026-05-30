@@ -1,6 +1,7 @@
 # Third-party packages
 flask
 matplotlib
+numpy>=1.26
 
 # Python standard library imports used by this project:
 # argparse

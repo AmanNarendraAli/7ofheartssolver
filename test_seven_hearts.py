@@ -1494,6 +1494,8 @@ def test_tune_eval_random_search_writes_ranked_candidate_reports() -> None:
     import tempfile
     from pathlib import Path
 
+    import numpy as np
+
     from tune_eval import parse_int_choices, run_tuning
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1515,17 +1517,42 @@ def test_tune_eval_random_search_writes_ranked_candidate_reports() -> None:
         )
 
         run_dir, paths = run_tuning(args)
-        summary_path = run_dir / "candidate_summary.csv"
-        parameters_path = run_dir / "candidate_parameters.csv"
+        summary_path = run_dir / "candidate_summary.npz"
+        parameters_path = run_dir / "candidate_parameters.npz"
         metadata_path = run_dir / "run_metadata.json"
 
         assert summary_path in paths
         assert parameters_path in paths
         assert metadata_path in paths
-        summary_csv = summary_path.read_text(encoding="utf-8")
-        assert "candidate_id,mode,score" in summary_csv
-        assert "c0000" in summary_csv
-        assert "weights.self_unlock" in parameters_path.read_text(encoding="utf-8")
+        with np.load(summary_path, allow_pickle=True) as summary:
+            assert summary.files == [
+                "rank",
+                "candidate_id",
+                "mode",
+                "score",
+                "target_baseline",
+                "average_advantage",
+                "standard_error",
+                "ci95_low",
+                "ci95_high",
+                "candidate_average_cards_left",
+                "candidate_cards_left_standard_error",
+                "candidate_win_rate",
+                "candidate_rank",
+                "sampled_mc_decisions",
+                "samples_per_move",
+                "rollout_max_turns",
+                "games",
+                "timeout_rate",
+            ]
+            assert summary["rank"].tolist() == [1, 2]
+            assert "c0000" in summary["candidate_id"].tolist()
+            assert summary["score"].dtype == np.float64
+            assert summary["games"].dtype == np.int64
+        with np.load(parameters_path, allow_pickle=True) as parameters:
+            assert parameters.files == ["candidate_id", "parameter", "value"]
+            assert "weights.self_unlock" in parameters["parameter"].tolist()
+            assert parameters["value"].dtype == np.float64
         assert '"mode": "heuristic"' in metadata_path.read_text(encoding="utf-8")
 
 

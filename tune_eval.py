@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import random
 from dataclasses import asdict
@@ -9,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Sequence
+
+import numpy as np
 
 from full_game_eval import unique_run_output_dir
 from seven_hearts import (
@@ -104,8 +105,8 @@ def format_float(value: float) -> str:
 
 
 def write_candidate_reports(rows: Sequence[dict[str, Any]], run_dir: Path) -> tuple[Path, Path]:
-    summary_path = run_dir / "candidate_summary.csv"
-    parameters_path = run_dir / "candidate_parameters.csv"
+    summary_path = run_dir / "candidate_summary.npz"
+    parameters_path = run_dir / "candidate_parameters.npz"
     summary_fields = [
         "rank",
         "candidate_id",
@@ -126,44 +127,50 @@ def write_candidate_reports(rows: Sequence[dict[str, Any]], run_dir: Path) -> tu
         "games",
         "timeout_rate",
     ]
-    parameter_fields = ["candidate_id", "parameter", "value"]
+    summary_string_fields = {"candidate_id", "mode", "target_baseline"}
+    summary_int_fields = {
+        "rank",
+        "sampled_mc_decisions",
+        "samples_per_move",
+        "rollout_max_turns",
+        "games",
+    }
 
     ranked = sorted(rows, key=lambda row: float(row["score"]), reverse=True)
-    with summary_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=summary_fields)
-        writer.writeheader()
-        for rank, row in enumerate(ranked, start=1):
-            output = {field: row[field] for field in summary_fields if field != "rank"}
-            output["rank"] = rank
-            writer.writerow(output)
+    summary_columns: dict[str, np.ndarray] = {}
+    for field in summary_fields:
+        values = list(range(1, len(ranked) + 1)) if field == "rank" else [row[field] for row in ranked]
+        if field in summary_string_fields:
+            summary_columns[field] = np.array(values, dtype=str)
+        elif field in summary_int_fields:
+            summary_columns[field] = np.array(values, dtype=np.int64)
+        else:
+            summary_columns[field] = np.array(values, dtype=np.float64)
+    # Load with: data = np.load("candidate_summary.npz", allow_pickle=True); data["score"]
+    np.savez_compressed(summary_path, **summary_columns)
 
-    with parameters_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=parameter_fields)
-        writer.writeheader()
-        for row in rows:
-            weights: StrategyWeights = row["_weights"]
-            for name, value in asdict(weights).items():
-                writer.writerow(
-                    {
-                        "candidate_id": row["candidate_id"],
-                        "parameter": f"weights.{name}",
-                        "value": format_float(value),
-                    }
-                )
-            writer.writerow(
-                {
-                    "candidate_id": row["candidate_id"],
-                    "parameter": "samples_per_move",
-                    "value": row["samples_per_move"],
-                }
-            )
-            writer.writerow(
-                {
-                    "candidate_id": row["candidate_id"],
-                    "parameter": "rollout_max_turns",
-                    "value": row["rollout_max_turns"],
-                }
-            )
+    parameter_candidate_ids: list[str] = []
+    parameter_names: list[str] = []
+    parameter_values: list[float] = []
+    for row in rows:
+        weights: StrategyWeights = row["_weights"]
+        for name, value in asdict(weights).items():
+            parameter_candidate_ids.append(str(row["candidate_id"]))
+            parameter_names.append(f"weights.{name}")
+            parameter_values.append(float(format_float(value)))
+        parameter_candidate_ids.append(str(row["candidate_id"]))
+        parameter_names.append("samples_per_move")
+        parameter_values.append(float(row["samples_per_move"]))
+        parameter_candidate_ids.append(str(row["candidate_id"]))
+        parameter_names.append("rollout_max_turns")
+        parameter_values.append(float(row["rollout_max_turns"]))
+    # Load with: params = np.load("candidate_parameters.npz", allow_pickle=True); params["parameter"]
+    np.savez_compressed(
+        parameters_path,
+        candidate_id=np.array(parameter_candidate_ids, dtype=str),
+        parameter=np.array(parameter_names, dtype=str),
+        value=np.array(parameter_values, dtype=np.float64),
+    )
 
     return summary_path, parameters_path
 

@@ -1,0 +1,12 @@
+Bootstrap: docker
+From: python:3.12-slim
+
+%post
+    python -m pip install --upgrade pip
+    python -m pip install --no-cache-dir "numpy>=1.26"
+
+%environment
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec python "$@"
