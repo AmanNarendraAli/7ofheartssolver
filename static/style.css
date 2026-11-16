@@ -305,7 +305,6 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   border: 1px solid #1a2840;
 }
 
-.card-stack .stack-card:nth-child(1) { transform: translate(0, 0); }
 .card-stack .stack-card:nth-child(2) { transform: translate(2px, -2px); }
 .card-stack .stack-card:nth-child(3) { transform: translate(4px, -4px); }
 
@@ -505,6 +504,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 }
 
 .recommendation strong { color: #ffd54f; }
+.recommendation ul { margin: 4px 0 0 20px; padding: 0; }
 
 .toast {
   position: fixed;

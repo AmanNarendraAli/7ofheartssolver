@@ -2,17 +2,17 @@ import random
 from dataclasses import dataclass
 
 from seven_hearts import (
-    Card,
     GameState,
     PlayerKnowledge,
     StrategyCandidate,
     StrategyWeights,
     Suit,
     SuitRun,
-    evaluate_move_monte_carlo,
     estimate_complete_game_metrics,
     estimate_strategy_self_play,
+    evaluate_move_monte_carlo,
     labels,
+    parse_cards,
     recommend_move,
     score_move,
 )
@@ -31,10 +31,6 @@ class Scenario:
     name: str
     state: GameState
     knowledge: PlayerKnowledge
-
-
-def cards(text: str) -> frozenset[Card]:
-    return frozenset(Card.parse(part) for part in text.split())
 
 
 def main() -> None:
@@ -164,7 +160,7 @@ def scenarios() -> tuple[Scenario, ...]:
             ),
             knowledge=PlayerKnowledge(
                 player=0,
-                hand=cards("7S AS 5H 9H 7D KC 3C 10D 2S 8S"),
+                hand=parse_cards("7S AS 5H 9H 7D KC 3C 10D 2S 8S"),
             ),
         ),
         Scenario(
@@ -180,7 +176,7 @@ def scenarios() -> tuple[Scenario, ...]:
             ),
             knowledge=PlayerKnowledge(
                 player=0,
-                hand=cards("7S AS 5H 9H KC 3C 10D 2S"),
+                hand=parse_cards("7S AS 5H 9H KC 3C 10D 2S"),
             ),
         ),
         Scenario(
@@ -196,7 +192,7 @@ def scenarios() -> tuple[Scenario, ...]:
             ),
             knowledge=PlayerKnowledge(
                 player=0,
-                hand=cards("7S 6S 8S AS 5H 9H KC 3C"),
+                hand=parse_cards("7S 6S 8S AS 5H 9H KC 3C"),
             ),
         ),
         Scenario(
@@ -212,7 +208,7 @@ def scenarios() -> tuple[Scenario, ...]:
             ),
             knowledge=PlayerKnowledge(
                 player=0,
-                hand=cards("7S AS KS 6H 8H 3C JD"),
+                hand=parse_cards("7S AS KS 6H 8H 3C JD"),
             ),
         ),
     )

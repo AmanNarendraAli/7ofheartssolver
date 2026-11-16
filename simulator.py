@@ -1,6 +1,6 @@
 """Flask-based visual game simulator for 7 of Hearts.
 
-Run with: ``py simulator.py`` and open http://127.0.0.1:5000/.
+Run with ``python simulator.py`` and open http://127.0.0.1:5000/.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from seven_hearts import (
 )
 
 
-SUIT_ORDER = (Suit.HEARTS, Suit.SPADES, Suit.DIAMONDS, Suit.CLUBS)
+DISPLAY_SUIT_ORDER = (Suit.HEARTS, Suit.SPADES, Suit.DIAMONDS, Suit.CLUBS)
 
 
 @dataclass
@@ -60,20 +60,9 @@ class GameSession:
                     f"not P{player}'s turn (current player is P{self.state.current_player})"
                 )
 
-            hand = self.hands[player]
             card = Card.parse(card_label) if card_label else None
-            self.state.validate_turn(hand, card)
-            assert self.last_pass is not None and self.move_log is not None
-
-            self.state, self.hands = apply_known_play(self.state, self.hands, player, card)
-            if card is None:
-                self.last_pass[player] = True
-                self.move_log.append(f"P{player} passed.")
-            else:
-                self.last_pass[player] = False
-                self.move_log.append(f"P{player} played {card.label()}.")
-
-            self._check_winner_locked()
+            self.state.validate_turn(self.hands[player], card)
+            self._apply_locked(player, card, f"P{player}")
             return self._snapshot_locked()
 
     def bot_step(self) -> dict:
@@ -89,39 +78,25 @@ class GameSession:
             if not self.seats_are_bot[player]:
                 return self._snapshot_locked()
 
-            legal = self.state.legal_moves(self.hands[player])
-            if not legal:
-                card = None
-            else:
-                card = choose_oracle_move(
-                    self.state, self.hands, player, DEFAULT_WEIGHTS
-                )
-
-            assert self.move_log is not None and self.last_pass is not None
-            self.state, self.hands = apply_known_play(self.state, self.hands, player, card)
-            if card is None:
-                self.last_pass[player] = True
-                self.move_log.append(f"P{player} (bot) passed.")
-            else:
-                self.last_pass[player] = False
-                self.move_log.append(f"P{player} (bot) played {card.label()}.")
-
-            self._check_winner_locked()
+            card = choose_oracle_move(self.state, self.hands, player, DEFAULT_WEIGHTS)
+            self._apply_locked(player, card, f"P{player} (bot)")
             return self._snapshot_locked()
 
     def snapshot(self) -> dict:
         with self.lock:
             return self._snapshot_locked()
 
-    def _check_winner_locked(self) -> None:
-        assert self.hands is not None
-        if self.winner is not None:
-            return
-        first_out = first_empty_player(self.hands)
-        if first_out is not None:
-            self.winner = first_out
-            assert self.move_log is not None
-            self.move_log.append(f"P{first_out} is out — first-out winner.")
+    def _apply_locked(self, player: int, card: Card | None, actor: str) -> None:
+        assert self.state is not None and self.hands is not None
+        assert self.last_pass is not None and self.move_log is not None
+        self.state, self.hands = apply_known_play(self.state, self.hands, player, card)
+        self.last_pass[player] = card is None
+        self.move_log.append(f"{actor} passed." if card is None else f"{actor} played {card.label()}.")
+
+        if self.winner is None:
+            self.winner = first_empty_player(self.hands)
+            if self.winner is not None:
+                self.move_log.append(f"P{self.winner} is out — first-out winner.")
 
     def _require_active(self) -> None:
         if self.state is None or self.hands is None or self.seats_are_bot is None:
@@ -172,12 +147,9 @@ class GameSession:
         ]
 
         table = {}
-        for suit in SUIT_ORDER:
+        for suit in DISPLAY_SUIT_ORDER:
             run = self.state.table[suit]
-            if run.is_open:
-                table[suit.value] = {"low": run.low, "high": run.high}
-            else:
-                table[suit.value] = None
+            table[suit.value] = {"low": run.low, "high": run.high} if run.is_open else None
 
         return {
             "active": True,
@@ -221,8 +193,7 @@ def api_new_game():
             seed = int(seed)
         except (TypeError, ValueError):
             return jsonify({"error": "seed must be an integer"}), 400
-    snapshot = SESSION.new_game(bot_seats, seed)
-    return jsonify(snapshot)
+    return jsonify(SESSION.new_game(bot_seats, seed))
 
 
 @app.get("/api/state")
@@ -239,21 +210,18 @@ def api_play():
         player = int(payload["player"])
     except (TypeError, ValueError):
         return jsonify({"error": "player must be an integer 0..3"}), 400
-    card = payload.get("card")
     try:
-        snapshot = SESSION.play(player, card)
+        return jsonify(SESSION.play(player, payload.get("card")))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return jsonify(snapshot)
 
 
 @app.post("/api/bot_step")
 def api_bot_step():
     try:
-        snapshot = SESSION.bot_step()
+        return jsonify(SESSION.bot_step())
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    return jsonify(snapshot)
 
 
 if __name__ == "__main__":

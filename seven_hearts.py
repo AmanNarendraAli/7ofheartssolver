@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from math import exp, isnan, nan, sqrt
@@ -163,6 +163,25 @@ class SuitRun:
         return mask
 
 
+def table_played_mask(runs: Iterable[tuple[Suit, SuitRun]]) -> int:
+    mask = 0
+    for suit, run in runs:
+        mask |= run.played_mask(suit)
+    return mask
+
+
+def table_legal_mask(runs: Iterable[tuple[Suit, SuitRun]]) -> int:
+    """Cards that may be played next on this table; only 7H before anything is played."""
+    runs = tuple(runs)
+    played_mask = table_played_mask(runs)
+    if not played_mask:
+        return card_bit(Card(Suit.HEARTS, 7))
+    legal_mask = 0
+    for suit, run in runs:
+        legal_mask |= run.legal_mask(suit)
+    return legal_mask & ~played_mask
+
+
 @dataclass(frozen=True)
 class MoveEvent:
     player: int
@@ -184,23 +203,13 @@ class GameState:
         return set(mask_to_cards(self.played_cards_mask()))
 
     def played_cards_mask(self) -> int:
-        mask = 0
-        for suit, run in self.table.items():
-            mask |= run.played_mask(suit)
-        return mask
+        return table_played_mask(self.table.items())
 
     def public_legal_cards(self) -> set[Card]:
         return set(mask_to_cards(self.public_legal_mask()))
 
     def public_legal_mask(self) -> int:
-        played_mask = self.played_cards_mask()
-        if not played_mask:
-            return card_bit(Card(Suit.HEARTS, 7))
-
-        legal_mask = 0
-        for suit, run in self.table.items():
-            legal_mask |= run.legal_mask(suit)
-        return legal_mask & ~played_mask
+        return table_legal_mask(self.table.items())
 
     def legal_moves(self, hand: Iterable[Card]) -> list[Card]:
         return list(mask_to_cards(card_set_mask(hand) & self.public_legal_mask()))
@@ -324,23 +333,13 @@ class FullInformationState:
         return set(mask_to_cards(self.played_cards_mask()))
 
     def played_cards_mask(self) -> int:
-        mask = 0
-        for suit, run in zip(SUIT_ORDER, self.table):
-            mask |= run.played_mask(suit)
-        return mask
+        return table_played_mask(zip(SUIT_ORDER, self.table))
 
     def public_legal_cards(self) -> set[Card]:
         return set(mask_to_cards(self.public_legal_mask()))
 
     def public_legal_mask(self) -> int:
-        played_mask = self.played_cards_mask()
-        if not played_mask:
-            return card_bit(Card(Suit.HEARTS, 7))
-
-        legal_mask = 0
-        for suit, run in zip(SUIT_ORDER, self.table):
-            legal_mask |= run.legal_mask(suit)
-        return legal_mask & ~played_mask
+        return table_legal_mask(zip(SUIT_ORDER, self.table))
 
     def legal_moves(self) -> tuple[Card, ...]:
         if self.winner is not None:
@@ -348,7 +347,7 @@ class FullInformationState:
         legal_mask = self.hand_masks[self.current_player] & self.public_legal_mask()
         return mask_to_cards(legal_mask)
 
-    def compact_key(self) -> tuple[tuple[int, int, int, int], tuple[tuple[int | None, int | None], ...], int, int | None, int]:
+    def compact_key(self) -> ExactCacheKey:
         table_key = tuple((run.low, run.high) for run in self.table)
         return self.hand_masks, table_key, self.current_player, self.winner, self.consecutive_passes
 
@@ -372,7 +371,7 @@ class FullInformationState:
         next_hands = list(self.hands)
         next_hands[player] = frozenset(next_hands[player] - {card})
         next_table = list(self.table)
-        suit_index = SUIT_ORDER.index(card.suit)
+        suit_index = SUIT_INDEX[card.suit]
         next_table[suit_index] = next_table[suit_index].play(card.rank)
         winner = player if not next_hands[player] else None
         return FullInformationState(
@@ -428,6 +427,10 @@ class ExactSearchBenchmark:
         return self.states_evaluated / self.elapsed_seconds
 
 
+def new_search_stats() -> dict[str, int]:
+    return {"states_evaluated": 0, "cache_hits": 0, "terminal_states": 0, "deadlock_states": 0}
+
+
 def terminal_value(winner: int) -> tuple[float, float, float, float]:
     values = [0.0, 0.0, 0.0, 0.0]
     values[winner] = 1.0
@@ -436,12 +439,7 @@ def terminal_value(winner: int) -> tuple[float, float, float, float]:
 
 def solve_full_information(state: FullInformationState) -> ExactSolverResult:
     cache: dict[ExactCacheKey, tuple[float, float, float, float]] = {}
-    stats = {
-        "states_evaluated": 0,
-        "cache_hits": 0,
-        "terminal_states": 0,
-        "deadlock_states": 0,
-    }
+    stats = new_search_stats()
 
     def solve_value(current: FullInformationState) -> tuple[float, float, float, float]:
         return solve_full_information_value(current, cache, stats)
@@ -494,7 +492,9 @@ def solve_full_information_value(
     current: FullInformationState,
     cache: dict[ExactCacheKey, tuple[float, float, float, float]],
     stats: dict[str, int],
+    policy: Callable[[FullInformationState], Card] | None = None,
 ) -> tuple[float, float, float, float]:
+    """Exact value of `current`. Every player moves rationally unless `policy` fixes their choice."""
     cache_key = current.compact_key()
     cached = cache.get(cache_key)
     if cached is not None:
@@ -512,7 +512,7 @@ def solve_full_information_value(
     if not legal:
         canonical = canonicalize_forced_pass_chain(current)
         if canonical != current:
-            value = solve_full_information_value(canonical, cache, stats)
+            value = solve_full_information_value(canonical, cache, stats, policy)
             cache[cache_key] = value
             return value
         if canonical.consecutive_passes >= 4:
@@ -520,12 +520,17 @@ def solve_full_information_value(
             cache[cache_key] = NEUTRAL_VALUE
             return NEUTRAL_VALUE
 
-    child_values = {
-        card: solve_full_information_value(current.after_action(card), cache, stats)
-        for card in legal
-    }
-    chosen = choose_rational_move(current.current_player, child_values)
-    value = child_values[chosen]
+    if policy is not None:
+        chosen = policy(current)
+        if chosen not in legal:
+            raise ValueError(f"fixed policy chose illegal move {chosen}; legal moves are {labels(legal)}")
+        value = solve_full_information_value(current.after_action(chosen), cache, stats, policy)
+    else:
+        child_values = {
+            card: solve_full_information_value(current.after_action(card), cache, stats)
+            for card in legal
+        }
+        value = child_values[choose_rational_move(current.current_player, child_values)]
     cache[cache_key] = value
     return value
 
@@ -536,45 +541,10 @@ def solve_full_information_against_policy(
     policy_name: str = "fixed_policy",
 ) -> ExactSolverResult:
     cache: dict[ExactCacheKey, tuple[float, float, float, float]] = {}
-    stats = {
-        "states_evaluated": 0,
-        "cache_hits": 0,
-        "terminal_states": 0,
-        "deadlock_states": 0,
-    }
+    stats = new_search_stats()
 
     def solve_policy_value(current: FullInformationState) -> tuple[float, float, float, float]:
-        cache_key = current.compact_key()
-        cached = cache.get(cache_key)
-        if cached is not None:
-            stats["cache_hits"] += 1
-            return cached
-
-        stats["states_evaluated"] += 1
-        if current.winner is not None:
-            stats["terminal_states"] += 1
-            value = terminal_value(current.winner)
-            cache[cache_key] = value
-            return value
-
-        legal = current.legal_moves()
-        if not legal:
-            canonical = canonicalize_forced_pass_chain(current)
-            if canonical != current:
-                value = solve_policy_value(canonical)
-                cache[cache_key] = value
-                return value
-            if canonical.consecutive_passes >= 4:
-                stats["deadlock_states"] += 1
-                cache[cache_key] = NEUTRAL_VALUE
-                return NEUTRAL_VALUE
-
-        chosen = policy(current)
-        if chosen not in legal:
-            raise ValueError(f"fixed policy chose illegal move {chosen}; legal moves are {labels(legal)}")
-        value = solve_policy_value(current.after_action(chosen))
-        cache[cache_key] = value
-        return value
+        return solve_full_information_value(current, cache, stats, policy)
 
     root_legal = state.legal_moves()
     move_values = {
@@ -643,13 +613,6 @@ def choose_rational_move(
         if len(tied) == 1:
             return next(iter(tied))
     return sorted(tied)[0]
-
-
-def choose_expected_value_vector_move(
-    player: int,
-    move_values: Mapping[Card, tuple[float, float, float, float]],
-) -> Card:
-    return choose_rational_move(player, move_values)
 
 
 def format_value(value: tuple[float, float, float, float]) -> str:
@@ -966,12 +929,7 @@ class FullGameResult:
         FullGameDecisionCounts,
         FullGameDecisionCounts,
         FullGameDecisionCounts,
-    ] = (
-        FullGameDecisionCounts(),
-        FullGameDecisionCounts(),
-        FullGameDecisionCounts(),
-        FullGameDecisionCounts(),
-    )
+    ] = (FullGameDecisionCounts(),) * 4
 
 
 @dataclass(frozen=True)
@@ -1363,13 +1321,43 @@ def evaluate_move_exact_imperfect_information(
     card: Card,
     max_deals: int | None = None,
 ) -> ExactImperfectInformationMoveScore:
+    require_solver_legal_move(state, knowledge, card, "exact imperfect-information")
+    enumeration = enumerate_hidden_deals(state, knowledge, max_deals=max_deals)
+    return evaluate_move_exact_imperfect_information_from_deals(state, knowledge, card, enumeration)
+
+
+def require_solver_legal_move(state: GameState, knowledge: PlayerKnowledge, card: Card, evaluation: str) -> None:
     if state.current_player != knowledge.player:
-        raise ValueError("exact imperfect-information evaluation requires knowledge.player to act")
+        raise ValueError(f"{evaluation} evaluation requires knowledge.player to act")
     if card not in state.legal_moves(knowledge.hand):
         raise ValueError(f"cannot evaluate illegal move {card}")
 
-    enumeration = enumerate_hidden_deals(state, knowledge, max_deals=max_deals)
-    return evaluate_move_exact_imperfect_information_from_deals(state, knowledge, card, enumeration)
+
+def no_deal_exact_score(card: Card, exhaustive: bool) -> ExactImperfectInformationMoveScore:
+    return ExactImperfectInformationMoveScore(
+        card=card,
+        expected_value=float("-inf"),
+        expected_value_vector=(float("-inf"), float("-inf"), float("-inf"), float("-inf")),
+        hidden_deals=0,
+        exhaustive=exhaustive,
+    )
+
+
+def materialize_hidden_deal(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    hidden_deal: HiddenDeal,
+    public_legal_moves: tuple[Card, ...],
+) -> tuple[dict[int, set[Card]], FullInformationState]:
+    """Combine the solver's hand with a hidden deal and check it keeps the same legal moves."""
+    hands = complete_hands(knowledge, hidden_deal)
+    full_state = FullInformationState.from_hands(hands, state)
+    if full_state.legal_moves() != public_legal_moves:
+        raise ValueError(
+            "materialized hidden deal changed the solver's legal move set: "
+            f"public={labels(public_legal_moves)}, materialized={labels(full_state.legal_moves())}"
+        )
+    return hands, full_state
 
 
 def evaluate_move_exact_imperfect_information_from_deals(
@@ -1380,39 +1368,18 @@ def evaluate_move_exact_imperfect_information_from_deals(
     exact_cache: dict[ExactCacheKey, tuple[float, float, float, float]] | None = None,
     exact_stats: dict[str, int] | None = None,
 ) -> ExactImperfectInformationMoveScore:
-    if state.current_player != knowledge.player:
-        raise ValueError("exact imperfect-information evaluation requires knowledge.player to act")
-    if card not in state.legal_moves(knowledge.hand):
-        raise ValueError(f"cannot evaluate illegal move {card}")
-
+    require_solver_legal_move(state, knowledge, card, "exact imperfect-information")
     if not enumeration.deals:
-        return ExactImperfectInformationMoveScore(
-            card=card,
-            expected_value=float("-inf"),
-            expected_value_vector=(float("-inf"), float("-inf"), float("-inf"), float("-inf")),
-            hidden_deals=0,
-            exhaustive=enumeration.exhaustive,
-        )
+        return no_deal_exact_score(card, enumeration.exhaustive)
 
     exact_cache = exact_cache if exact_cache is not None else {}
-    exact_stats = exact_stats if exact_stats is not None else {
-        "states_evaluated": 0,
-        "cache_hits": 0,
-        "terminal_states": 0,
-        "deadlock_states": 0,
-    }
+    exact_stats = exact_stats if exact_stats is not None else new_search_stats()
     values: list[tuple[float, float, float, float]] = []
     outcome_counts = [0, 0, 0, 0]
     neutral_outcomes = 0
     public_legal_moves = tuple(state.legal_moves(knowledge.hand))
     for hidden_deal in enumeration.deals:
-        hands = complete_hands(knowledge, hidden_deal)
-        full_state = FullInformationState.from_hands(hands, state)
-        if full_state.legal_moves() != public_legal_moves:
-            raise ValueError(
-                "materialized hidden deal changed the solver's legal move set: "
-                f"public={labels(public_legal_moves)}, materialized={labels(full_state.legal_moves())}"
-            )
+        _, full_state = materialize_hidden_deal(state, knowledge, hidden_deal, public_legal_moves)
         child_state = full_state.after_action(card)
         value = solve_full_information_value(child_state, exact_cache, exact_stats)
         values.append(value)
@@ -1449,12 +1416,7 @@ def recommend_move_exact_imperfect_information(
 
     enumeration = enumerate_hidden_deals(state, knowledge, max_deals=max_deals)
     exact_cache: dict[ExactCacheKey, tuple[float, float, float, float]] = {}
-    exact_stats = {
-        "states_evaluated": 0,
-        "cache_hits": 0,
-        "terminal_states": 0,
-        "deadlock_states": 0,
-    }
+    exact_stats = new_search_stats()
     scores = tuple(
         evaluate_move_exact_imperfect_information_from_deals(
             state,
@@ -1471,7 +1433,7 @@ def recommend_move_exact_imperfect_information(
     value_vectors = {score.card: score.expected_value_vector for score in scores}
     best_value = max(score.expected_value for score in scores)
     best_moves = tuple(score.card for score in scores if score.expected_value == best_value)
-    chosen_move = choose_expected_value_vector_move(knowledge.player, value_vectors) if scores else None
+    chosen_move = choose_rational_move(knowledge.player, value_vectors) if scores else None
     return ExactImperfectInformationResult(
         chosen_move=chosen_move,
         best_moves=best_moves,
@@ -1497,31 +1459,15 @@ def evaluate_move_exact_information_limited_policy_from_deals(
     policy = normalize_information_limited_policy(policy)
     if policy != INFORMATION_LIMITED_HEURISTIC_GREEDY_POLICY:
         raise ValueError("exact information-limited policy EV currently requires deterministic heuristic-greedy policy")
-    if state.current_player != knowledge.player:
-        raise ValueError("exact information-limited evaluation requires knowledge.player to act")
-    if card not in state.legal_moves(knowledge.hand):
-        raise ValueError(f"cannot evaluate illegal move {card}")
-
+    require_solver_legal_move(state, knowledge, card, "exact information-limited")
     if not enumeration.deals:
-        return ExactImperfectInformationMoveScore(
-            card=card,
-            expected_value=float("-inf"),
-            expected_value_vector=(float("-inf"), float("-inf"), float("-inf"), float("-inf")),
-            hidden_deals=0,
-            exhaustive=enumeration.exhaustive,
-        )
+        return no_deal_exact_score(card, enumeration.exhaustive)
 
     outcome_counts = [0, 0, 0, 0]
     neutral_outcomes = 0
     public_legal_moves = tuple(state.legal_moves(knowledge.hand))
     for hidden_deal in enumeration.deals:
-        hands = complete_hands(knowledge, hidden_deal)
-        full_state = FullInformationState.from_hands(hands, state)
-        if full_state.legal_moves() != public_legal_moves:
-            raise ValueError(
-                "materialized hidden deal changed the solver's legal move set: "
-                f"public={labels(public_legal_moves)}, materialized={labels(full_state.legal_moves())}"
-            )
+        hands, _ = materialize_hidden_deal(state, knowledge, hidden_deal, public_legal_moves)
         next_state, next_hands = apply_known_play(state, hands, knowledge.player, card)
         result = rollout_information_limited(
             next_state,
@@ -1600,7 +1546,7 @@ def recommend_move_exact_information_limited_policy(
     value_vectors = {score.card: score.expected_value_vector for score in scores}
     best_value = max(score.expected_value for score in scores)
     best_moves = tuple(score.card for score in scores if score.expected_value == best_value)
-    chosen_move = choose_expected_value_vector_move(knowledge.player, value_vectors) if scores else None
+    chosen_move = choose_rational_move(knowledge.player, value_vectors) if scores else None
     return ExactImperfectInformationResult(
         chosen_move=chosen_move,
         best_moves=best_moves,
@@ -1693,6 +1639,52 @@ def recommend_move_monte_carlo(
         for card in legal
     ]
     return max(results, key=lambda result: result.score)
+
+
+def rollout_move_score(
+    card: Card,
+    player: int,
+    results: Sequence[RolloutResult],
+    weights: StrategyWeights,
+    policy_name: str,
+    exhaustive: bool = False,
+) -> MonteCarloMoveScore:
+    """Aggregate rollouts after `card` into a score: weighted win rate + finish margin - timeout penalty."""
+    samples = len(results)
+    if samples == 0:
+        return MonteCarloMoveScore(
+            card=card,
+            score=float("-inf"),
+            win_rate=0.0,
+            average_finish_margin=0.0,
+            samples=0,
+            policy_name=policy_name,
+            exhaustive=exhaustive,
+        )
+
+    wins = sum(1 for result in results if result.winner == player)
+    finish_margin_total = 0.0
+    for result in results:
+        finish_margin_total += finish_margin(result.final_hand_counts, player)
+    win_rate = wins / samples
+    average_finish_margin = finish_margin_total / samples
+    timeout_rate = sum(1 for result in results if result.timed_out) / samples
+    return MonteCarloMoveScore(
+        card=card,
+        score=(
+            win_rate * weights.monte_carlo_win_rate_weight
+            + average_finish_margin
+            - timeout_rate * weights.monte_carlo_timeout_penalty
+        ),
+        win_rate=win_rate,
+        average_finish_margin=average_finish_margin,
+        samples=samples,
+        average_turns=sum(result.turns_played for result in results) / samples,
+        timeout_rate=timeout_rate,
+        win_rate_standard_error=sqrt(win_rate * (1.0 - win_rate) / samples),
+        policy_name=policy_name,
+        exhaustive=exhaustive,
+    )
 
 
 def forced_move_monte_carlo_score(card: Card, policy_name: str) -> MonteCarloMoveScore:
@@ -1794,58 +1786,16 @@ def evaluate_move_monte_carlo_from_deals(
             "oracle_greedy_full_information_immediate_win",
         )
 
-    wins = 0
-    finish_margin_total = 0.0
-    turns_total = 0
-    timeouts = 0
-    completed_samples = 0
-
+    results: list[RolloutResult] = []
     for hidden_deal in hidden_deals:
         hands = complete_hands(knowledge, hidden_deal)
         if card not in hands[knowledge.player]:
             continue
-
         next_state, next_hands = apply_known_play(state, hands, knowledge.player, card)
-        result = rollout_oracle(next_state, next_hands, max_turns, weights)
-        completed_samples += 1
-        if result.winner == knowledge.player:
-            wins += 1
-        finish_margin_total += finish_margin(result.final_hand_counts, knowledge.player)
-        turns_total += result.turns_played
-        if result.timed_out:
-            timeouts += 1
+        results.append(rollout_oracle(next_state, next_hands, max_turns, weights))
 
-    if completed_samples == 0:
-        return MonteCarloMoveScore(
-            card=card,
-            score=float("-inf"),
-            win_rate=0.0,
-            average_finish_margin=0.0,
-            samples=0,
-            exhaustive=exhaustive,
-        )
-
-    win_rate = wins / completed_samples
-    average_finish_margin = finish_margin_total / completed_samples
-    average_turns = turns_total / completed_samples
-    timeout_rate = timeouts / completed_samples
-    win_rate_standard_error = sqrt(win_rate * (1.0 - win_rate) / completed_samples)
-    score = (
-        win_rate * weights.monte_carlo_win_rate_weight
-        + average_finish_margin
-        - timeout_rate * weights.monte_carlo_timeout_penalty
-    )
-    return MonteCarloMoveScore(
-        card=card,
-        score=score,
-        win_rate=win_rate,
-        average_finish_margin=average_finish_margin,
-        samples=completed_samples,
-        average_turns=average_turns,
-        timeout_rate=timeout_rate,
-        win_rate_standard_error=win_rate_standard_error,
-        policy_name="oracle_greedy_full_information",
-        exhaustive=exhaustive,
+    return rollout_move_score(
+        card, knowledge.player, results, weights, "oracle_greedy_full_information", exhaustive
     )
 
 
@@ -1879,6 +1829,18 @@ def mask_after_play(hand_masks: Sequence[int], player: int, card: Card | None) -
         raise ValueError(f"cannot play {card}: card is not in hand mask")
     next_masks[player] &= ~bit
     return tuple(next_masks)  # type: ignore[return-value]
+
+
+def masks_after_known_play(
+    state: GameState,
+    hand_masks: Sequence[int],
+    player: int,
+    card: Card | None,
+) -> tuple[GameState, tuple[int, int, int, int]]:
+    """Mask counterpart of apply_known_play: play `card` and refresh public hand counts."""
+    next_state = state_with_hand_counts_from_masks(state, hand_masks).after_play(player, card)
+    next_hands = mask_after_play(hand_masks, player, card)
+    return state_with_hand_counts_from_masks(next_state, next_hands), next_hands
 
 
 def complete_hand_masks(knowledge: PlayerKnowledge, hidden_deal: HiddenDeal) -> tuple[int, int, int, int]:
@@ -1941,10 +1903,7 @@ def recommend_move_information_limited_monte_carlo(
 
     rng = rng or random.Random()
     hidden_deal_selection = choose_hidden_deals_for_budget(state, knowledge, samples_per_move, rng)
-    decision_policy_cache: InformationLimitedPolicyCache | None = (
-        policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None)
-    )
-    decision_rollout_cache = rollout_cache if is_deterministic_heuristic_policy(policy) else None
+    decision_policy_cache, decision_rollout_cache = decision_caches(policy, policy_cache, rollout_cache)
     results = [
         evaluate_move_information_limited_monte_carlo_from_deals(
             state,
@@ -1989,6 +1948,7 @@ def evaluate_move_information_limited_monte_carlo(
         )
     rng = rng or random.Random()
     hidden_deal_selection = choose_hidden_deals_for_budget(state, knowledge, samples, rng)
+    decision_policy_cache, decision_rollout_cache = decision_caches(policy, policy_cache, rollout_cache)
     return evaluate_move_information_limited_monte_carlo_from_deals(
         state,
         knowledge,
@@ -1999,8 +1959,8 @@ def evaluate_move_information_limited_monte_carlo(
         policy,
         rationality,
         rng,
-        policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None),
-        rollout_cache if is_deterministic_heuristic_policy(policy) else None,
+        decision_policy_cache,
+        decision_rollout_cache,
         hidden_deal_selection.exhaustive,
     )
 
@@ -2031,74 +1991,28 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
             f"{policy_name}_immediate_win",
         )
 
-    wins = 0
-    finish_margin_total = 0.0
-    turns_total = 0
-    timeouts = 0
-    completed_samples = 0
-
+    results: list[RolloutResult] = []
     for hidden_deal in hidden_deals:
         hand_masks = complete_hand_masks(knowledge, hidden_deal)
         if not hand_masks[knowledge.player] & card_bit(card):
             continue
-
-        counted_state = state_with_hand_counts_from_masks(state, hand_masks)
-        next_state = counted_state.after_play(knowledge.player, card)
-        next_hands = mask_after_play(hand_masks, knowledge.player, card)
-        next_state = state_with_hand_counts_from_masks(next_state, next_hands)
-        result = rollout_information_limited_masks(
-            next_state,
-            next_hands,
-            max_turns,
-            weights,
-            policy,
-            rationality,
-            rng,
-            None,
-            policy_cache,
-            rollout_cache,
-        )
-        completed_samples += 1
-        if result.winner == knowledge.player:
-            wins += 1
-        finish_margin_total += finish_margin(result.final_hand_counts, knowledge.player)
-        turns_total += result.turns_played
-        if result.timed_out:
-            timeouts += 1
-
-    if completed_samples == 0:
-        return MonteCarloMoveScore(
-            card=card,
-            score=float("-inf"),
-            win_rate=0.0,
-            average_finish_margin=0.0,
-            samples=0,
-            policy_name=policy_name,
-            exhaustive=exhaustive,
+        next_state, next_hands = masks_after_known_play(state, hand_masks, knowledge.player, card)
+        results.append(
+            rollout_information_limited_masks(
+                next_state,
+                next_hands,
+                max_turns,
+                weights,
+                policy,
+                rationality,
+                rng,
+                None,
+                policy_cache,
+                rollout_cache,
+            )
         )
 
-    win_rate = wins / completed_samples
-    average_finish_margin = finish_margin_total / completed_samples
-    average_turns = turns_total / completed_samples
-    timeout_rate = timeouts / completed_samples
-    win_rate_standard_error = sqrt(win_rate * (1.0 - win_rate) / completed_samples)
-    score = (
-        win_rate * weights.monte_carlo_win_rate_weight
-        + average_finish_margin
-        - timeout_rate * weights.monte_carlo_timeout_penalty
-    )
-    return MonteCarloMoveScore(
-        card=card,
-        score=score,
-        win_rate=win_rate,
-        average_finish_margin=average_finish_margin,
-        samples=completed_samples,
-        average_turns=average_turns,
-        timeout_rate=timeout_rate,
-        win_rate_standard_error=win_rate_standard_error,
-        policy_name=policy_name,
-        exhaustive=exhaustive,
-    )
+    return rollout_move_score(card, knowledge.player, results, weights, policy_name, exhaustive)
 
 
 def recommend_move_perfect_information_rollout_ev(
@@ -2135,10 +2049,7 @@ def recommend_move_perfect_information_rollout_ev(
         return forced_move_monte_carlo_score(legal[0], f"{policy_name}_forced_move")
 
     rng = rng or random.Random()
-    decision_policy_cache: InformationLimitedPolicyCache | None = (
-        policy_cache if policy_cache is not None else ({} if is_deterministic_heuristic_policy(policy) else None)
-    )
-    decision_rollout_cache = rollout_cache if is_deterministic_heuristic_policy(policy) else None
+    decision_policy_cache, decision_rollout_cache = decision_caches(policy, policy_cache, rollout_cache)
     scores = tuple(
         evaluate_move_perfect_information_rollout_ev(
             state,
@@ -2196,18 +2107,9 @@ def evaluate_move_perfect_information_rollout_ev(
         )
 
     rng = rng or random.Random()
-    rollouts = max(1, rollouts)
-    hand_masks = hand_masks_from_hands(hands)
-    next_state = state_with_hand_counts_from_masks(state, hand_masks).after_play(player, card)
-    next_hands = mask_after_play(hand_masks, player, card)
-    next_state = state_with_hand_counts_from_masks(next_state, next_hands)
-
-    wins = 0
-    finish_margin_total = 0.0
-    turns_total = 0
-    timeouts = 0
-    for _ in range(rollouts):
-        result = rollout_information_limited_masks(
+    next_state, next_hands = masks_after_known_play(state, hand_masks_from_hands(hands), player, card)
+    results = [
+        rollout_information_limited_masks(
             next_state,
             next_hands,
             max_turns,
@@ -2219,34 +2121,20 @@ def evaluate_move_perfect_information_rollout_ev(
             policy_cache,
             rollout_cache,
         )
-        if result.winner == player:
-            wins += 1
-        finish_margin_total += finish_margin(result.final_hand_counts, player)
-        turns_total += result.turns_played
-        if result.timed_out:
-            timeouts += 1
+        for _ in range(max(1, rollouts))
+    ]
+    return rollout_move_score(card, player, results, weights, policy_name)
 
-    win_rate = wins / rollouts
-    average_finish_margin = finish_margin_total / rollouts
-    average_turns = turns_total / rollouts
-    timeout_rate = timeouts / rollouts
-    win_rate_standard_error = sqrt(win_rate * (1.0 - win_rate) / rollouts)
-    score = (
-        win_rate * weights.monte_carlo_win_rate_weight
-        + average_finish_margin
-        - timeout_rate * weights.monte_carlo_timeout_penalty
-    )
-    return MonteCarloMoveScore(
-        card=card,
-        score=score,
-        win_rate=win_rate,
-        average_finish_margin=average_finish_margin,
-        samples=rollouts,
-        average_turns=average_turns,
-        timeout_rate=timeout_rate,
-        win_rate_standard_error=win_rate_standard_error,
-        policy_name=policy_name,
-    )
+
+def decision_caches(
+    policy: str,
+    policy_cache: InformationLimitedPolicyCache | None,
+    rollout_cache: RolloutTranspositionCache | None,
+) -> tuple[InformationLimitedPolicyCache | None, RolloutTranspositionCache | None]:
+    """Caches for one decision; caching is only sound for the deterministic greedy policy."""
+    if not is_deterministic_heuristic_policy(policy):
+        return policy_cache, None
+    return (policy_cache if policy_cache is not None else {}), rollout_cache
 
 
 def perfect_information_counterpart_policy_name(policy: str, rationality: float) -> str:
@@ -2264,66 +2152,18 @@ def rollout_information_limited(
     policy_cache: InformationLimitedPolicyCache | None = None,
     rollout_cache: RolloutTranspositionCache | None = None,
 ) -> RolloutResult:
-    policy = normalize_information_limited_policy(policy)
-    rng = rng or random.Random()
-    current_state = state_with_hand_counts(state, hands)
-    current_hands = {player: set(hand) for player, hand in hands.items()}
-    deck = frozenset(
-        card
-        for hand in current_hands.values()
-        for card in hand
-    ) | frozenset(current_state.played_cards())
-    use_rollout_cache = rollout_cache is not None and is_deterministic_heuristic_policy(policy)
-    visited: list[tuple[RolloutTranspositionCacheKey, int]] = []
-
-    for turns_played in range(max_turns + 1):
-        if use_rollout_cache:
-            cache_key = rollout_transposition_cache_key(
-                current_state,
-                current_hands,
-                deck,
-                weights,
-                policy,
-                rationality,
-                max_turns - turns_played,
-            )
-            cached = rollout_cache.get(cache_key) if rollout_cache is not None else None
-            if cached is not None:
-                result = RolloutResult(
-                    cached.winner,
-                    turns_played + cached.turns_played,
-                    cached.final_hand_counts,
-                    cached.timed_out,
-                )
-                store_rollout_suffixes(rollout_cache, visited, result)
-                return result
-            visited.append((cache_key, turns_played))
-
-        winner = first_empty_player(current_hands)
-        if winner is not None:
-            result = RolloutResult(winner, turns_played, hand_count_tuple(current_hands))
-            store_rollout_suffixes(rollout_cache, visited, result)
-            return result
-        if turns_played == max_turns:
-            break
-
-        player = current_state.current_player
-        card = choose_information_limited_move(
-            current_state,
-            current_hands[player],
-            player,
-            weights_for_player(weights, player),
-            policy,
-            rationality,
-            rng,
-            deck,
-            policy_cache,
-        )
-        current_state, current_hands = apply_known_play(current_state, current_hands, player, card)
-
-    result = RolloutResult(None, max_turns, hand_count_tuple(current_hands), timed_out=True)
-    store_rollout_suffixes(rollout_cache, visited, result)
-    return result
+    return rollout_information_limited_masks(
+        state,
+        hand_masks_from_hands(hands),
+        max_turns,
+        weights,
+        policy,
+        rationality,
+        rng,
+        None,
+        policy_cache,
+        rollout_cache,
+    )
 
 
 def rollout_information_limited_masks(
@@ -2391,9 +2231,7 @@ def rollout_information_limited_masks(
             deck_mask,
             policy_cache,
         )
-        current_state = current_state.after_play(player, card)
-        current_hands = mask_after_play(current_hands, player, card)
-        current_state = state_with_hand_counts_from_masks(current_state, current_hands)
+        current_state, current_hands = masks_after_known_play(current_state, current_hands, player, card)
 
     result = RolloutResult(None, max_turns, mask_hand_count_tuple(current_hands), timed_out=True)
     store_rollout_suffixes(rollout_cache, visited, result)
@@ -2411,44 +2249,17 @@ def choose_information_limited_move(
     deck: frozenset[Card] | None = None,
     cache: InformationLimitedPolicyCache | None = None,
 ) -> Card | None:
-    policy = normalize_information_limited_policy(policy)
-    hand_set = frozenset(hand)
-    hand_mask = card_set_mask(hand_set)
-    legal_mask = hand_mask & state.public_legal_mask()
-    only_legal = maybe_only_card(legal_mask)
-    if only_legal is not None:
-        return only_legal
-    legal = list(mask_to_cards(legal_mask))
-    if not legal:
-        return None
-
-    cache_key = None
-    if cache is not None and is_deterministic_heuristic_policy(policy):
-        cache_key = information_limited_policy_cache_key(
-            state,
-            hand_mask,
-            player,
-            weights,
-            policy,
-            rationality,
-            deck,
-        )
-        cached = cache.get(cache_key)
-        if cached is not None or cache_key in cache:
-            return cached
-
-    knowledge = PlayerKnowledge(player, hand_set, deck=deck)
-    model = build_opponent_model(state, knowledge)
-    scores = tuple(score_move(state, knowledge, card, model=model, weights=weights) for card in legal)
-    if is_deterministic_heuristic_policy(policy):
-        choice = max(scores, key=lambda scored: scored.score).card
-        if cache is not None and cache_key is not None:
-            cache[cache_key] = choice
-        return choice
-    if policy == "softmax":
-        rng = rng or random.Random()
-        return choose_softmax_move(scores, rationality, rng)
-    raise ValueError(f"unknown information-limited policy: {policy}")
+    return choose_information_limited_move_from_mask(
+        state,
+        card_set_mask(hand),
+        player,
+        weights,
+        policy,
+        rationality,
+        rng,
+        card_set_mask(deck) if deck is not None else None,
+        cache,
+    )
 
 
 def choose_information_limited_move_from_mask(
@@ -2560,28 +2371,37 @@ InformationLimitedPolicyCacheKey = tuple[
 InformationLimitedPolicyCache = MutableMapping[InformationLimitedPolicyCacheKey, Card | None]
 
 
-class BoundedInformationLimitedPolicyCache(OrderedDict[InformationLimitedPolicyCacheKey, Card | None]):
-    def __init__(self, max_entries: int = 50_000) -> None:
+DEFAULT_CACHE_MAX_ENTRIES = 50_000
+
+
+class BoundedLRUCache(OrderedDict):
+    """Dict that evicts its least recently used entry beyond `max_entries` (0 means unbounded)."""
+
+    def __init__(self, max_entries: int = DEFAULT_CACHE_MAX_ENTRIES) -> None:
         super().__init__()
         self.max_entries = max_entries
 
-    def __getitem__(self, key: InformationLimitedPolicyCacheKey) -> Card | None:
+    def __getitem__(self, key):
         value = super().__getitem__(key)
         self.move_to_end(key)
         return value
 
-    def get(self, key: InformationLimitedPolicyCacheKey, default: Card | None = None) -> Card | None:
+    def get(self, key, default=None):
         if key not in self:
             return default
         return self[key]
 
-    def __setitem__(self, key: InformationLimitedPolicyCacheKey, value: Card | None) -> None:
+    def __setitem__(self, key, value) -> None:
         if key in self:
             self.move_to_end(key)
         super().__setitem__(key, value)
         if self.max_entries > 0:
             while len(self) > self.max_entries:
                 self.popitem(last=False)
+
+
+class BoundedInformationLimitedPolicyCache(BoundedLRUCache):
+    pass
 
 
 RolloutTranspositionCacheKey = tuple[
@@ -2599,28 +2419,8 @@ RolloutTranspositionCacheKey = tuple[
 RolloutTranspositionCache = MutableMapping[RolloutTranspositionCacheKey, RolloutResult]
 
 
-class BoundedRolloutTranspositionCache(OrderedDict[RolloutTranspositionCacheKey, RolloutResult]):
-    def __init__(self, max_entries: int = 50_000) -> None:
-        super().__init__()
-        self.max_entries = max_entries
-
-    def __getitem__(self, key: RolloutTranspositionCacheKey) -> RolloutResult:
-        value = super().__getitem__(key)
-        self.move_to_end(key)
-        return value
-
-    def get(self, key: RolloutTranspositionCacheKey, default: RolloutResult | None = None) -> RolloutResult | None:
-        if key not in self:
-            return default
-        return self[key]
-
-    def __setitem__(self, key: RolloutTranspositionCacheKey, value: RolloutResult) -> None:
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        if self.max_entries > 0:
-            while len(self) > self.max_entries:
-                self.popitem(last=False)
+class BoundedRolloutTranspositionCache(BoundedLRUCache):
+    pass
 
 
 def information_limited_policy_cache_key(
@@ -2633,14 +2433,12 @@ def information_limited_policy_cache_key(
     deck: frozenset[Card] | None,
 ) -> InformationLimitedPolicyCacheKey:
     policy = normalize_information_limited_policy(policy)
-    table_key = tuple((run.low, run.high) for run in canonical_table(state.table))
-    history_key = tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history)
     deck_mask = card_set_mask(deck) if deck is not None else None
     return (
-        table_key,
+        table_key_of(state),
         state.hand_counts,
         state.current_player,
-        history_key,
+        history_key_of(state),
         hand_mask,
         player,
         weights,
@@ -2648,6 +2446,14 @@ def information_limited_policy_cache_key(
         rationality,
         deck_mask,
     )
+
+
+def table_key_of(state: GameState) -> tuple[tuple[int | None, int | None], ...]:
+    return tuple((run.low, run.high) for run in canonical_table(state.table))
+
+
+def history_key_of(state: GameState) -> tuple[tuple[int, int], ...]:
+    return tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history)
 
 
 def weights_for_player(
@@ -2674,15 +2480,11 @@ def rollout_transposition_cache_key(
     rationality: float,
     remaining_turns: int,
 ) -> RolloutTranspositionCacheKey:
-    policy = normalize_information_limited_policy(policy)
-    return (
-        tuple((run.low, run.high) for run in canonical_table(state.table)),
-        tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history),
-        state.current_player,
-        tuple(card_set_mask(hands[player]) for player in range(4)),  # type: ignore[return-value]
-        hand_count_tuple(hands),
+    return rollout_transposition_cache_key_from_masks(
+        state,
+        hand_masks_from_hands(hands),
         card_set_mask(deck),
-        canonical_rollout_weights(weights),
+        weights,
         policy,
         rationality,
         remaining_turns,
@@ -2700,8 +2502,8 @@ def rollout_transposition_cache_key_from_masks(
 ) -> RolloutTranspositionCacheKey:
     policy = normalize_information_limited_policy(policy)
     return (
-        tuple((run.low, run.high) for run in canonical_table(state.table)),
-        tuple((event.player, card_index(event.card) if event.card is not None else -1) for event in state.history),
+        table_key_of(state),
+        history_key_of(state),
         state.current_player,
         tuple(hand_masks),  # type: ignore[return-value]
         mask_hand_count_tuple(hand_masks),
@@ -2771,11 +2573,10 @@ def exact_local_move_value(
     card: Card,
     weights: StrategyWeights = DEFAULT_WEIGHTS,
 ) -> float:
-    hand_after = set(hands[player]) - {card}
     hands_after = hands_after_play(hands, player, card)
     next_state = state.after_play(player, card)
     before_legal = set(state.legal_moves(hands[player]))
-    after_legal = set(next_state.legal_moves(hand_after))
+    after_legal = set(next_state.legal_moves(hands_after[player]))
     newly_self_playable = after_legal - before_legal
 
     opened_for_table = next_state.public_legal_cards() - state.public_legal_cards()
@@ -3077,7 +2878,7 @@ def trace_mc_heuristic_decision(
         agent_name=agent.name,
         legal_moves=tuple(legal),
         hand=tuple(sorted(hands[player])),
-        table_key=tuple((run.low, run.high) for run in canonical_table(state.table)),
+        table_key=table_key_of(state),
         heuristic_card=heuristic_best.card,
         heuristic_score=heuristic_best.score,
         heuristic_reasons=heuristic_best.reasons,
@@ -3140,22 +2941,14 @@ def simulate_full_game_to_completion(
         agent = agents_by_seat[player]
         legal = state.legal_moves(current_hands[player])
         immediate_win = bool(legal and len(current_hands[player]) == 1)
-        previous_counts = decision_counts[player]
+        sampled_mc = agent.policy == "information_limited_monte_carlo" and len(legal) > 1 and not immediate_win
+        counts = decision_counts[player]
         decision_counts[player] = FullGameDecisionCounts(
-            turns=previous_counts.turns + 1,
-            forced_passes=previous_counts.forced_passes + (0 if legal else 1),
-            single_legal_moves=previous_counts.single_legal_moves + (1 if len(legal) == 1 else 0),
-            immediate_wins=previous_counts.immediate_wins + (1 if immediate_win else 0),
-            sampled_mc_decisions=previous_counts.sampled_mc_decisions
-            + (
-                1
-                if (
-                    agent.policy == "information_limited_monte_carlo"
-                    and len(legal) > 1
-                    and not immediate_win
-                )
-                else 0
-            ),
+            turns=counts.turns + 1,
+            forced_passes=counts.forced_passes + (not legal),
+            single_legal_moves=counts.single_legal_moves + (len(legal) == 1),
+            immediate_wins=counts.immediate_wins + immediate_win,
+            sampled_mc_decisions=counts.sampled_mc_decisions + sampled_mc,
         )
         if (
             trace_mc_heuristic
@@ -3219,12 +3012,7 @@ def finalized_full_game_result(
     turns_played: int,
     timed_out: bool,
     decision_traces: Sequence[DecisionTrace] = (),
-    decision_counts_by_seat: Sequence[FullGameDecisionCounts] = (
-        FullGameDecisionCounts(),
-        FullGameDecisionCounts(),
-        FullGameDecisionCounts(),
-        FullGameDecisionCounts(),
-    ),
+    decision_counts_by_seat: Sequence[FullGameDecisionCounts] = (FullGameDecisionCounts(),) * 4,
 ) -> FullGameResult:
     ranks = [4, 4, 4, 4]
     seen: set[int] = set()
@@ -3241,24 +3029,8 @@ def finalized_full_game_result(
         ranks[player] = rank
 
     completed_traces = tuple(
-        DecisionTrace(
-            deal_index=trace.deal_index,
-            rotation_index=trace.rotation_index,
-            turn=trace.turn,
-            player=trace.player,
-            agent_name=trace.agent_name,
-            legal_moves=trace.legal_moves,
-            hand=trace.hand,
-            table_key=trace.table_key,
-            heuristic_card=trace.heuristic_card,
-            heuristic_score=trace.heuristic_score,
-            heuristic_reasons=trace.heuristic_reasons,
-            mc_card=trace.mc_card,
-            mc_score=trace.mc_score,
-            mc_win_rate=trace.mc_win_rate,
-            mc_average_finish_margin=trace.mc_average_finish_margin,
-            mc_samples=trace.mc_samples,
-            disagreed=trace.disagreed,
+        replace(
+            trace,
             final_rank=ranks[trace.player],
             final_cards_left=final_hand_counts[trace.player],
             winner=normalized_order[0] if normalized_order else None,
@@ -3375,36 +3147,25 @@ def evaluate_duplicate_deal_seat_rotation(
     )
     game_results: list[DuplicateDealGameResult] = []
 
-    total_games = len(jobs)
-    completed_games = 0
+    def record(game_result: DuplicateDealGameResult) -> None:
+        game_results.append(game_result)
+        if progress_callback is not None:
+            progress_callback(
+                len(game_results),
+                len(jobs),
+                game_result.deal_index,
+                game_result.rotation_index,
+                game_result.result,
+            )
+
     if workers <= 1:
         for job in jobs:
-            game_result = simulate_duplicate_deal_game_job(job)
-            game_results.append(game_result)
-            completed_games += 1
-            if progress_callback is not None:
-                progress_callback(
-                    completed_games,
-                    total_games,
-                    game_result.deal_index,
-                    game_result.rotation_index,
-                    game_result.result,
-                )
+            record(simulate_duplicate_deal_game_job(job))
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(simulate_duplicate_deal_game_job, job) for job in jobs]
             for future in as_completed(futures):
-                game_result = future.result()
-                game_results.append(game_result)
-                completed_games += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        completed_games,
-                        total_games,
-                        game_result.deal_index,
-                        game_result.rotation_index,
-                        game_result.result,
-                    )
+                record(future.result())
 
     game_results.sort(key=lambda game_result: (game_result.deal_index, game_result.rotation_index))
 
@@ -3415,6 +3176,10 @@ def evaluate_duplicate_deal_seat_rotation(
         primary_agent_name=primary_agent_name,
         game_results=game_results,
     )
+
+
+DECISION_COUNT_FIELDS = ("turns", "forced_passes", "single_legal_moves", "immediate_wins", "sampled_mc_decisions")
+SUMMARY_TOTAL_FIELDS = ("seats", "wins", "cards_left", "rank", *DECISION_COUNT_FIELDS)
 
 
 def summarize_duplicate_deal_results(
@@ -3437,30 +3202,14 @@ def summarize_duplicate_deal_results(
 
         primary_cards_left: int | None = None
         for seat, agent_name in enumerate(result.agent_names_by_seat):
-            bucket = totals.setdefault(
-                agent_name,
-                {
-                    "seats": 0.0,
-                    "wins": 0.0,
-                    "cards_left": 0.0,
-                    "rank": 0.0,
-                    "turns": 0.0,
-                    "forced_passes": 0.0,
-                    "single_legal_moves": 0.0,
-                    "immediate_wins": 0.0,
-                    "sampled_mc_decisions": 0.0,
-                },
-            )
+            bucket = totals.setdefault(agent_name, dict.fromkeys(SUMMARY_TOTAL_FIELDS, 0.0))
             decision_counts = result.decision_counts_by_seat[seat]
             bucket["seats"] += 1.0
             bucket["wins"] += 1.0 if result.winner == seat else 0.0
             bucket["cards_left"] += result.final_hand_counts[seat]
             bucket["rank"] += result.ranks_by_seat[seat]
-            bucket["turns"] += decision_counts.turns
-            bucket["forced_passes"] += decision_counts.forced_passes
-            bucket["single_legal_moves"] += decision_counts.single_legal_moves
-            bucket["immediate_wins"] += decision_counts.immediate_wins
-            bucket["sampled_mc_decisions"] += decision_counts.sampled_mc_decisions
+            for name in DECISION_COUNT_FIELDS:
+                bucket[name] += getattr(decision_counts, name)
             agent_samples = samples_by_agent.setdefault(
                 agent_name,
                 {"wins": [], "cards_left": [], "rank": []},
@@ -3494,11 +3243,7 @@ def summarize_duplicate_deal_results(
                 cards_left_standard_error=standard_error(samples["cards_left"]),
                 average_rank=bucket["rank"] / seats,
                 rank_standard_error=standard_error(samples["rank"]),
-                turns=int(bucket["turns"]),
-                forced_passes=int(bucket["forced_passes"]),
-                single_legal_moves=int(bucket["single_legal_moves"]),
-                immediate_wins=int(bucket["immediate_wins"]),
-                sampled_mc_decisions=int(bucket["sampled_mc_decisions"]),
+                **{name: int(bucket[name]) for name in DECISION_COUNT_FIELDS},
             )
         )
 
@@ -3829,6 +3574,11 @@ def recommend_move(
         return None
     model = build_opponent_model(state, knowledge)
     return max((score_move(state, knowledge, card, model, weights) for card in legal), key=lambda s: s.score)
+
+
+def parse_cards(text: str) -> frozenset[Card]:
+    """Parse a space-separated card list such as "7H 10S AC"."""
+    return frozenset(Card.parse(part) for part in text.split())
 
 
 def labels(cards: Iterable[Card]) -> str:

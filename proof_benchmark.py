@@ -1,28 +1,13 @@
 import argparse
 
 from seven_hearts import (
-    Card,
     FullInformationState,
     GameState,
     Suit,
     SuitRun,
     benchmark_full_information_search,
+    parse_cards,
 )
-
-
-FAST_BENCHMARKS = {
-    "single_suit_2_cards_each",
-    "multi_suit_3_cards_each",
-    "multi_suit_4_cards_each",
-}
-HARD_BENCHMARKS = {
-    "four_suit_5_cards_each",
-    "chain_pressure_8_cards_each",
-}
-
-
-def cards(text: str) -> frozenset[Card]:
-    return frozenset(Card.parse(part) for part in text.split())
 
 
 def main() -> None:
@@ -51,10 +36,10 @@ def benchmark_positions(include_hard: bool = False) -> tuple[tuple[str, FullInfo
             "single_suit_2_cards_each",
             FullInformationState.from_hands(
                 {
-                    0: cards("6H 8H"),
-                    1: cards("5H 9H"),
-                    2: cards("4H 10H"),
-                    3: cards("3H JH"),
+                    0: parse_cards("6H 8H"),
+                    1: parse_cards("5H 9H"),
+                    2: parse_cards("4H 10H"),
+                    3: parse_cards("3H JH"),
                 },
                 GameState(
                     table={suit: SuitRun() for suit in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -66,10 +51,10 @@ def benchmark_positions(include_hard: bool = False) -> tuple[tuple[str, FullInfo
             "multi_suit_3_cards_each",
             FullInformationState.from_hands(
                 {
-                    0: cards("6H 8H 6C"),
-                    1: cards("5H 9H 8C"),
-                    2: cards("7D AC AD"),
-                    3: cards("7S AS KD"),
+                    0: parse_cards("6H 8H 6C"),
+                    1: parse_cards("5H 9H 8C"),
+                    2: parse_cards("7D AC AD"),
+                    3: parse_cards("7S AS KD"),
                 },
                 GameState(
                     table={
@@ -87,10 +72,10 @@ def benchmark_positions(include_hard: bool = False) -> tuple[tuple[str, FullInfo
             "multi_suit_4_cards_each",
             FullInformationState.from_hands(
                 {
-                    0: cards("5H 6H 8H 6C"),
-                    1: cards("4H 9H 8C AC"),
-                    2: cards("3H 10H 7D AD"),
-                    3: cards("2H JH 7S AS"),
+                    0: parse_cards("5H 6H 8H 6C"),
+                    1: parse_cards("4H 9H 8C AC"),
+                    2: parse_cards("3H 10H 7D AD"),
+                    3: parse_cards("2H JH 7S AS"),
                 },
                 GameState(
                     table={
@@ -125,10 +110,10 @@ def hard_benchmark_positions() -> tuple[tuple[str, FullInformationState], ...]:
             "four_suit_5_cards_each",
             FullInformationState.from_hands(
                 {
-                    0: cards("6H 8H 6C 8C 6D"),
-                    1: cards("5H 9H 5C 9C 8D"),
-                    2: cards("4H 10H 4C 10C 7S"),
-                    3: cards("3H JH 3C 8S 9D"),
+                    0: parse_cards("6H 8H 6C 8C 6D"),
+                    1: parse_cards("5H 9H 5C 9C 8D"),
+                    2: parse_cards("4H 10H 4C 10C 7S"),
+                    3: parse_cards("3H JH 3C 8S 9D"),
                 },
                 GameState(
                     table={suit: SuitRun() for suit in Suit} | {
@@ -144,10 +129,10 @@ def hard_benchmark_positions() -> tuple[tuple[str, FullInformationState], ...]:
             "chain_pressure_8_cards_each",
             FullInformationState.from_hands(
                 {
-                    0: cards("4H 5H 6H 8H 9H 6C 8C 6D"),
-                    1: cards("3H 10H 5C 9C 5D 8D 6S 8S"),
-                    2: cards("2H JH 4C 10C 4D 9D 5S 9S"),
-                    3: cards("AH QH 3C JC 3D 10D 4S 10S"),
+                    0: parse_cards("4H 5H 6H 8H 9H 6C 8C 6D"),
+                    1: parse_cards("3H 10H 5C 9C 5D 8D 6S 8S"),
+                    2: parse_cards("2H JH 4C 10C 4D 9D 5S 9S"),
+                    3: parse_cards("AH QH 3C JC 3D 10D 4S 10S"),
                 },
                 GameState(
                     table={suit: SuitRun() for suit in Suit} | all_suits_open,

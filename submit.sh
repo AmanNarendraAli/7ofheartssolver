@@ -3,7 +3,7 @@
 #SBATCH --partition=shared
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=128        # <-- node core count; collaborator confirms 128
+#SBATCH --cpus-per-task=128        # node core count
 #SBATCH --mem-per-cpu=2000         # MB per core; pure-Python job is light, adjust if needed
 #SBATCH --time=1-00:00:00          # D-HH:MM:SS; raise/lower per estimate & partition cap
 #SBATCH --output=logs/tune_%j.out

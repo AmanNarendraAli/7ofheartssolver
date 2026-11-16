@@ -1,20 +1,10 @@
 "use strict";
 
-const RANKS = [
-  { rank: 1, label: "A" },
-  { rank: 2, label: "2" },
-  { rank: 3, label: "3" },
-  { rank: 4, label: "4" },
-  { rank: 5, label: "5" },
-  { rank: 6, label: "6" },
-  { rank: 7, label: "7" },
-  { rank: 8, label: "8" },
-  { rank: 9, label: "9" },
-  { rank: 10, label: "10" },
-  { rank: 11, label: "J" },
-  { rank: 12, label: "Q" },
-  { rank: 13, label: "K" },
-];
+const RANK_LABELS = { 1: "A", 11: "J", 12: "Q", 13: "K" };
+const RANKS = Array.from({ length: 13 }, (_, i) => ({
+  rank: i + 1,
+  label: RANK_LABELS[i + 1] || String(i + 1),
+}));
 
 const SUITS = ["H", "S", "D", "C"];
 
@@ -32,12 +22,7 @@ const SUIT_NAME = {
   C: "Clubs",
 };
 
-const SEAT_LABELS = {
-  0: "Seat 0 (bottom)",
-  1: "Seat 1 (left)",
-  2: "Seat 2 (top)",
-  3: "Seat 3 (right)",
-};
+const SEAT_LABELS = ["Seat 0 (bottom)", "Seat 1 (left)", "Seat 2 (top)", "Seat 3 (right)"];
 
 const BOT_DELAY_MS = 850;
 
@@ -59,25 +44,23 @@ function onToggleLog() {
   btn.setAttribute("aria-expanded", String(!collapsed));
 }
 
-function showSetup() {
+function cancelBotTick() {
   if (botTickHandle) {
     clearTimeout(botTickHandle);
     botTickHandle = null;
   }
+}
+
+function showSetup() {
+  cancelBotTick();
   document.getElementById("setup-overlay").classList.remove("hidden");
   document.getElementById("game-area").classList.add("hidden");
   document.getElementById("winner-banner").classList.add("hidden");
 }
 
 async function onStart() {
-  const botSeats = [];
-  document
-    .querySelectorAll(".seat-toggle input[type=checkbox]")
-    .forEach((box) => {
-      if (box.checked) {
-        botSeats.push(parseInt(box.dataset.seat, 10));
-      }
-    });
+  const botSeats = Array.from(document.querySelectorAll(".seat-toggle input[type=checkbox]:checked"))
+    .map((box) => parseInt(box.dataset.seat, 10));
 
   const seedValue = document.getElementById("seed-input").value.trim();
   const body = { bot_seats: botSeats };
@@ -96,26 +79,15 @@ async function onStart() {
   applySnapshot(snapshot);
 }
 
-async function onPass() {
+// Pass when cardLabel is null.
+async function submitPlay(cardLabel) {
   if (!lastSnapshot || lastSnapshot.active_is_bot) return;
   const player = lastSnapshot.current_player;
-  const snapshot = await postJSON("/api/play", { player, card: null });
-  if (snapshot.error) {
-    showToast(snapshot.error);
-    return;
-  }
-  applySnapshot(snapshot);
+  applyResponse(await postJSON("/api/play", { player, card: cardLabel }));
 }
 
-async function onCardClick(cardLabel) {
-  if (!lastSnapshot || lastSnapshot.active_is_bot) return;
-  const player = lastSnapshot.current_player;
-  const snapshot = await postJSON("/api/play", { player, card: cardLabel });
-  if (snapshot.error) {
-    showToast(snapshot.error);
-    return;
-  }
-  applySnapshot(snapshot);
+function onPass() {
+  return submitPlay(null);
 }
 
 async function botStep() {
@@ -123,12 +95,12 @@ async function botStep() {
   if (!lastSnapshot || !lastSnapshot.active_is_bot || lastSnapshot.winner !== null) {
     return;
   }
-  const snapshot = await postJSON("/api/bot_step", {});
-  if (snapshot.error) {
-    showToast(snapshot.error);
-    return;
-  }
-  applySnapshot(snapshot);
+  applyResponse(await postJSON("/api/bot_step", {}));
+}
+
+function applyResponse(snapshot) {
+  if (snapshot.error) showToast(snapshot.error);
+  else applySnapshot(snapshot);
 }
 
 function applySnapshot(snapshot) {
@@ -141,10 +113,7 @@ function applySnapshot(snapshot) {
   renderLog(snapshot);
   renderWinner(snapshot);
 
-  if (botTickHandle) {
-    clearTimeout(botTickHandle);
-    botTickHandle = null;
-  }
+  cancelBotTick();
   if (snapshot.winner === null && snapshot.active_is_bot) {
     botTickHandle = setTimeout(botStep, BOT_DELAY_MS);
   }
@@ -156,11 +125,9 @@ function renderSeats(snapshot) {
     el.classList.toggle("active", seat.is_active);
     el.classList.toggle("winner", seat.is_winner);
 
-    const role = seat.is_bot ? "Bot" : "Human";
-    const badges = [];
-    badges.push(
-      `<span class="badge ${seat.is_bot ? "bot" : "human"}">${role}</span>`,
-    );
+    const badges = [
+      seat.is_bot ? '<span class="badge bot">Bot</span>' : '<span class="badge human">Human</span>',
+    ];
     if (seat.is_winner) {
       badges.push('<span class="badge winner">Winner</span>');
     } else if (seat.passed_last) {
@@ -261,7 +228,7 @@ function renderHand(snapshot) {
       ? `Play ${card.rankLabel} of ${SUIT_NAME[card.suit]}`
       : `Not currently legal`;
     div.addEventListener("click", () => {
-      if (isLegal) onCardClick(cardLabel);
+      if (isLegal) submitPlay(cardLabel);
       else showToast("That card is not currently legal.");
     });
     handEl.appendChild(div);
@@ -284,7 +251,7 @@ function renderRecommendation(snapshot) {
   el.innerHTML = `
     <div>Recommended: <strong>${card.rankLabel}${SUIT_GLYPH[card.suit]}</strong>
     (heuristic score ${rec.score.toFixed(2)})</div>
-    ${reasons ? `<ul style="margin: 4px 0 0 20px; padding: 0;">${reasons}</ul>` : ""}
+    ${reasons ? `<ul>${reasons}</ul>` : ""}
   `;
   el.classList.remove("hidden");
 }
@@ -311,9 +278,7 @@ function renderWinner(snapshot) {
 }
 
 function parseCardLabel(label) {
-  const suit = label.slice(-1);
-  const rankText = label.slice(0, -1);
-  return { suit, rankLabel: rankText };
+  return { suit: label.slice(-1), rankLabel: label.slice(0, -1) };
 }
 
 async function postJSON(url, body) {

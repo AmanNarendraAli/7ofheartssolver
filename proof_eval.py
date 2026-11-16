@@ -21,6 +21,7 @@ from seven_hearts import (
     build_opponent_model,
     evaluate_move_monte_carlo,
     labels,
+    parse_cards,
     recommend_move_exact_imperfect_information,
     score_move,
 )
@@ -63,10 +64,6 @@ class EngineEvaluation:
     continuation_model: str
 
 
-def cards(text: str) -> frozenset[Card]:
-    return frozenset(Card.parse(part) for part in text.split())
-
-
 def evaluation_scenarios() -> tuple[ProofEvaluationScenario, ...]:
     reduced_state = GameState(
         table={suit: SuitRun() for suit in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
@@ -75,8 +72,8 @@ def evaluation_scenarios() -> tuple[ProofEvaluationScenario, ...]:
     )
     reduced_knowledge = PlayerKnowledge(
         player=0,
-        hand=cards("5H 6H 8H"),
-        deck=cards("5H 6H 7H 8H 9H 7C AC AD"),
+        hand=parse_cards("5H 6H 8H"),
+        deck=parse_cards("5H 6H 7H 8H 9H 7C AC AD"),
     )
 
     multi_suit_table = {
@@ -93,8 +90,8 @@ def evaluation_scenarios() -> tuple[ProofEvaluationScenario, ...]:
     )
     multi_suit_knowledge = PlayerKnowledge(
         player=0,
-        hand=cards("5H 9H 6C 8C"),
-        deck=cards("4H 5H 6H 7H 8H 9H 10H 6C 7C 8C 7D 7S AC AD"),
+        hand=parse_cards("5H 9H 6C 8C"),
+        deck=parse_cards("4H 5H 6H 7H 8H 9H 10H 6C 7C 8C 7D 7S AC AD"),
     )
 
     return (
@@ -115,6 +112,7 @@ def evaluate_scenario(
         raise ValueError(f"scenario {scenario.name} has no exact move to evaluate")
 
     exact_by_card = {score.card: score.expected_value for score in exact.move_scores}
+    exact_vector_by_card = {score.card: score.expected_value_vector for score in exact.move_scores}
     legal = tuple(score.card for score in exact.move_scores)
     model = build_opponent_model(scenario.state, scenario.knowledge)
     scored_moves = {
@@ -125,6 +123,7 @@ def evaluate_scenario(
     heuristic_choice = max(legal, key=lambda card: heuristic_scores[card])
 
     monte_carlo_scores: dict[Card, MonteCarloMoveScore] = {}
+    monte_carlo_choice = None
     if include_monte_carlo:
         rng = random.Random(seed)
         monte_carlo_scores = {
@@ -139,21 +138,15 @@ def evaluate_scenario(
             for card in legal
         }
         monte_carlo_choice = max(legal, key=lambda card: monte_carlo_scores[card].score)
-    else:
-        monte_carlo_choice = None
 
     move_evaluations = tuple(
         MoveEvaluation(
             card=card,
             exact_ev=exact_by_card[card],
-            exact_ev_vector=next(score.expected_value_vector for score in exact.move_scores if score.card == card),
+            exact_ev_vector=exact_vector_by_card[card],
             heuristic_score=heuristic_scores[card],
             heuristic_components=dict(scored_moves[card].components),
-            monte_carlo_score=monte_carlo_scores[card].score if card in monte_carlo_scores else None,
-            monte_carlo_win_rate=monte_carlo_scores[card].win_rate if card in monte_carlo_scores else None,
-            monte_carlo_standard_error=(
-                monte_carlo_scores[card].win_rate_standard_error if card in monte_carlo_scores else None
-            ),
+            **monte_carlo_fields(monte_carlo_scores.get(card)),
         )
         for card in legal
     )
@@ -177,13 +170,24 @@ def evaluate_scenario(
     )
 
 
+def monte_carlo_fields(score: MonteCarloMoveScore | None) -> dict[str, float | None]:
+    if score is None:
+        return {}
+    return {
+        "monte_carlo_score": score.score,
+        "monte_carlo_win_rate": score.win_rate,
+        "monte_carlo_standard_error": score.win_rate_standard_error,
+    }
+
+
 def render_reports(evaluations: tuple[EngineEvaluation, ...], output_dir: Path = REPORT_DIR) -> tuple[Path, ...]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    paths = [write_summary_csv(evaluations, output_dir), write_move_csv(evaluations, output_dir)]
-    paths.append(plot_regret_summary(evaluations, output_dir))
-    for evaluation in evaluations:
-        paths.append(plot_scenario_dashboard(evaluation, output_dir))
-    return tuple(paths)
+    return (
+        write_summary_csv(evaluations, output_dir),
+        write_move_csv(evaluations, output_dir),
+        plot_regret_summary(evaluations, output_dir),
+        *(plot_scenario_dashboard(evaluation, output_dir) for evaluation in evaluations),
+    )
 
 
 def write_summary_csv(evaluations: tuple[EngineEvaluation, ...], output_dir: Path) -> Path:

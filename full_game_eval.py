@@ -13,6 +13,7 @@ from time import perf_counter
 from typing import Any, Callable
 
 from seven_hearts import (
+    DEFAULT_CACHE_MAX_ENTRIES,
     DEFAULT_MONTE_CARLO_AGENT_NAME,
     DecisionTrace,
     DuplicateDealEvaluation,
@@ -110,9 +111,7 @@ def unique_run_output_dir(base_dir: Path) -> Path:
 def json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, tuple):
-        return [json_safe(item) for item in value]
-    if isinstance(value, list):
+    if isinstance(value, (tuple, list)):
         return [json_safe(item) for item in value]
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
@@ -172,41 +171,13 @@ def heuristic_weight_metadata(weights: Any) -> dict[str, Any]:
 
 def active_agent_parameter_rows(agent: FullGameAgent) -> list[list[Any]]:
     metadata = agent_metadata(agent)
-    rows: list[list[Any]] = [
-        [agent.name, agent.policy, "policy", agent.policy],
-    ]
-    if metadata["uses_rollout_ev"]:
-        rollout_ev = metadata["rollout_ev"]
-        rows.extend(
-            [
-                [
-                    agent.name,
-                    agent.policy,
-                    "rollout_ev.samples_or_rollouts_per_move",
-                    rollout_ev["samples_or_rollouts_per_move"],
-                ],
-                [agent.name, agent.policy, "rollout_ev.rollout_max_turns", rollout_ev["rollout_max_turns"]],
-                [agent.name, agent.policy, "rollout_ev.rollout_policy", rollout_ev["rollout_policy"]],
-                [agent.name, agent.policy, "rollout_ev.rationality", rollout_ev["rationality"]],
-                [
-                    agent.name,
-                    agent.policy,
-                    "rollout_ev.score_weights.monte_carlo_win_rate_weight",
-                    rollout_ev["score_weights"]["monte_carlo_win_rate_weight"],
-                ],
-                [
-                    agent.name,
-                    agent.policy,
-                    "rollout_ev.score_weights.monte_carlo_timeout_penalty",
-                    rollout_ev["score_weights"]["monte_carlo_timeout_penalty"],
-                ],
-            ]
-        )
-    if metadata["uses_heuristic_weights"]:
-        rows.extend(
-            [agent.name, agent.policy, f"heuristic_weights.{name}", value]
-            for name, value in heuristic_weight_metadata(agent.weights).items()
-        )
+    rows: list[list[Any]] = [[agent.name, agent.policy, "policy", agent.policy]]
+    for section in ("rollout_ev", "heuristic_weights"):
+        if section in metadata:
+            rows.extend(
+                [agent.name, agent.policy, name, value]
+                for name, value in flatten_metadata(section, metadata[section])
+            )
     return rows
 
 
@@ -231,8 +202,8 @@ def build_global_parameter_metadata(args: argparse.Namespace, output_dir: Path, 
             "rotations_per_deal": 4,
         },
         "implementation_defaults": {
-            "information_limited_policy_cache_max_entries": 50_000,
-            "rollout_transposition_cache_max_entries": 50_000,
+            "information_limited_policy_cache_max_entries": DEFAULT_CACHE_MAX_ENTRIES,
+            "rollout_transposition_cache_max_entries": DEFAULT_CACHE_MAX_ENTRIES,
         },
         "elapsed_seconds": elapsed_seconds,
     }
