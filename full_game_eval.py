@@ -13,6 +13,7 @@ from time import perf_counter
 from typing import Any, Callable
 
 from seven_hearts import (
+    DECISION_COUNT_FIELDS,
     DEFAULT_CACHE_MAX_ENTRIES,
     DEFAULT_MONTE_CARLO_AGENT_NAME,
     DecisionTrace,
@@ -264,7 +265,7 @@ def write_metadata_reports(
 
 def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> tuple[Path, Path, Path]:
     agents_path = output_dir / "agent_summary.csv"
-    paired_path = output_dir / "paired_card_advantage.csv"
+    paired_path = output_dir / "paired_comparisons.csv"
     games_path = output_dir / "games.csv"
 
     with agents_path.open("w", newline="", encoding="utf-8") as file:
@@ -275,15 +276,13 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
                 "seats_played",
                 "win_rate",
                 "win_rate_standard_error",
-                "average_cards_left",
-                "cards_left_standard_error",
+                "average_cards_at_first_out",
+                "cards_at_first_out_standard_error",
                 "average_rank",
                 "rank_standard_error",
-                "turns",
-                "forced_passes",
-                "single_legal_moves",
-                "immediate_wins",
-                "sampled_mc_decisions",
+                "average_cards_left",
+                "cards_left_standard_error",
+                *DECISION_COUNT_FIELDS,
             ]
         )
         for summary in evaluation.agent_summaries:
@@ -293,15 +292,13 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
                     summary.seats_played,
                     f"{summary.win_rate:.6f}",
                     f"{summary.win_rate_standard_error:.6f}",
-                    f"{summary.average_cards_left:.6f}",
-                    f"{summary.cards_left_standard_error:.6f}",
+                    f"{summary.average_cards_at_first_out:.6f}",
+                    f"{summary.cards_at_first_out_standard_error:.6f}",
                     f"{summary.average_rank:.6f}",
                     f"{summary.rank_standard_error:.6f}",
-                    summary.turns,
-                    summary.forced_passes,
-                    summary.single_legal_moves,
-                    summary.immediate_wins,
-                    summary.sampled_mc_decisions,
+                    f"{summary.average_cards_left:.6f}",
+                    f"{summary.cards_left_standard_error:.6f}",
+                    *(getattr(summary, name) for name in DECISION_COUNT_FIELDS),
                 ]
             )
 
@@ -311,33 +308,33 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
             [
                 "primary_agent",
                 "baseline_agent",
+                "metric",
                 "comparisons",
                 "average_advantage",
                 "standard_error",
                 "ci95_low",
                 "ci95_high",
                 "average_oracle_gap",
-                "oracle_gap_standard_error",
                 "oracle_gap_ci95_low",
                 "oracle_gap_ci95_high",
             ]
         )
-        for advantage in evaluation.paired_card_advantages:
-            is_oracle_gap = "oracle" in advantage.baseline_agent.lower()
-            oracle_gap = -advantage.average_advantage
+        for comparison in evaluation.paired_comparisons:
+            # Against an oracle, the gap is how far the primary agent falls short of it.
+            is_oracle = "oracle" in comparison.baseline_agent.lower()
             writer.writerow(
                 [
-                    advantage.primary_agent,
-                    advantage.baseline_agent,
-                    advantage.comparisons,
-                    f"{advantage.average_advantage:.6f}",
-                    f"{advantage.standard_error:.6f}",
-                    f"{advantage.ci95_low:.6f}",
-                    f"{advantage.ci95_high:.6f}",
-                    f"{oracle_gap:.6f}" if is_oracle_gap else "",
-                    f"{advantage.standard_error:.6f}" if is_oracle_gap else "",
-                    f"{-advantage.ci95_high:.6f}" if is_oracle_gap else "",
-                    f"{-advantage.ci95_low:.6f}" if is_oracle_gap else "",
+                    comparison.primary_agent,
+                    comparison.baseline_agent,
+                    comparison.metric,
+                    comparison.comparisons,
+                    f"{comparison.average_advantage:.6f}",
+                    f"{comparison.standard_error:.6f}",
+                    f"{comparison.ci95_low:.6f}",
+                    f"{comparison.ci95_high:.6f}",
+                    f"{-comparison.average_advantage:.6f}" if is_oracle else "",
+                    f"{-comparison.ci95_high:.6f}" if is_oracle else "",
+                    f"{-comparison.ci95_low:.6f}" if is_oracle else "",
                 ]
             )
 
@@ -348,21 +345,13 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
                 "deal_index",
                 "rotation_index",
                 "seed",
-                "seat_0_agent",
-                "seat_1_agent",
-                "seat_2_agent",
-                "seat_3_agent",
+                *(f"seat_{seat}_agent" for seat in range(4)),
                 "winner_seat",
                 "winner_agent",
                 "finish_order",
-                "seat_0_rank",
-                "seat_1_rank",
-                "seat_2_rank",
-                "seat_3_rank",
-                "seat_0_cards_left",
-                "seat_1_cards_left",
-                "seat_2_cards_left",
-                "seat_3_cards_left",
+                *(f"seat_{seat}_rank" for seat in range(4)),
+                *(f"seat_{seat}_cards_at_first_out" for seat in range(4)),
+                *(f"seat_{seat}_cards_left" for seat in range(4)),
                 "turns_played",
                 "timed_out",
             ]
@@ -382,6 +371,7 @@ def write_summary_csv(evaluation: DuplicateDealEvaluation, output_dir: Path) -> 
                     winner_agent,
                     " ".join(str(player) for player in result.finish_order),
                     *result.ranks_by_seat,
+                    *(result.first_out_hand_counts or result.final_hand_counts),
                     *result.final_hand_counts,
                     result.turns_played,
                     int(result.timed_out),
@@ -477,16 +467,17 @@ def print_summary(evaluation: DuplicateDealEvaluation, paths: tuple[Path, ...], 
     print("\nAgent summaries:")
     for summary in evaluation.agent_summaries:
         print(
-            f"  {summary.agent_name}: cards_left={summary.average_cards_left:.3f}, "
-            f"rank={summary.average_rank:.3f}, win={summary.win_rate:.1%}, seats={summary.seats_played}"
+            f"  {summary.agent_name}: win={summary.win_rate:.1%} +/- {summary.win_rate_standard_error:.1%}, "
+            f"cards_at_first_out={summary.average_cards_at_first_out:.2f}, "
+            f"rank={summary.average_rank:.2f}, seats={summary.seats_played}"
         )
 
-    print("\nPaired card advantage:")
-    for advantage in evaluation.paired_card_advantages:
+    print("\nPaired advantage (positive = primary agent better, +/- 95% CI):")
+    for comparison in evaluation.paired_comparisons:
         print(
-            f"  {advantage.primary_agent} vs {advantage.baseline_agent}: "
-            f"{advantage.average_advantage:+.3f} +/- {advantage.standard_error:.3f} "
-            f"over {advantage.comparisons} comparisons"
+            f"  {comparison.metric:>18} vs {comparison.baseline_agent}: "
+            f"{comparison.average_advantage:+.3f} +/- {1.96 * comparison.standard_error:.3f} "
+            f"over {comparison.comparisons} games"
         )
 
     print("\nWrote reports:")

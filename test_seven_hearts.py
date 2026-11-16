@@ -8,6 +8,8 @@ from seven_hearts import (
     FullInformationState,
     GameState,
     FullGameAgent,
+    FullGameResult,
+    PAIRED_METRICS,
     MoveEvent,
     PlayerKnowledge,
     StrategyCandidate,
@@ -59,6 +61,7 @@ from seven_hearts import (
     solve_full_information,
     solve_full_information_against_policy,
     simulate_full_game_to_completion,
+    summarize_duplicate_deal_results,
     time_to_playable,
 )
 from proof_benchmark import hard_benchmark_positions
@@ -1001,11 +1004,16 @@ def test_full_game_to_completion_reports_final_ranks_and_cards_left() -> None:
     assert result.winner in {0, 1, 2, 3}
     assert sorted(result.ranks_by_seat) == [1, 2, 3, 4]
     assert result.final_hand_counts[result.winner] == 0
+    assert result.first_out_hand_counts is not None
+    assert result.first_out_hand_counts[result.winner] == 0
+    assert all(
+        first_out >= final for first_out, final in zip(result.first_out_hand_counts, result.final_hand_counts)
+    )
     assert sum(1 for count in result.final_hand_counts if count > 0) <= 1
     assert not result.timed_out
 
 
-def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
+def test_duplicate_deal_seat_rotation_reports_paired_comparisons() -> None:
     agents = (
         FullGameAgent("Monte Carlo", "heuristic"),
         FullGameAgent("Random", "random"),
@@ -1031,13 +1039,45 @@ def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
     }
     assert all(summary.seats_played == 8 for summary in evaluation.agent_summaries)
     assert all(summary.turns > 0 for summary in evaluation.agent_summaries)
-    assert {advantage.baseline_agent for advantage in evaluation.paired_card_advantages} == {
-        "Random",
-        "Greedy",
-        "Heuristic",
+    assert {(comparison.metric, comparison.baseline_agent) for comparison in evaluation.paired_comparisons} == {
+        (metric, baseline) for metric in PAIRED_METRICS for baseline in ("Random", "Greedy", "Heuristic")
     }
-    assert all(advantage.comparisons == 8 for advantage in evaluation.paired_card_advantages)
+    assert all(comparison.comparisons == 8 for comparison in evaluation.paired_comparisons)
     assert evaluation.average_turns > 0.0
+
+
+def test_paired_comparisons_measure_first_out_outcomes() -> None:
+    names = ("Monte Carlo", "Heuristic", "Random", "Greedy")
+    primary_wins = FullGameResult(
+        agent_names_by_seat=names,
+        winner=0,
+        finish_order=(0, 2, 1, 3),
+        ranks_by_seat=(1, 3, 2, 4),
+        final_hand_counts=(0, 0, 0, 2),
+        turns_played=50,
+        first_out_hand_counts=(0, 4, 3, 6),
+    )
+    heuristic_wins = FullGameResult(
+        agent_names_by_seat=names,
+        winner=1,
+        finish_order=(1, 0, 2, 3),
+        ranks_by_seat=(2, 1, 3, 4),
+        final_hand_counts=(0, 0, 0, 1),
+        turns_played=50,
+        first_out_hand_counts=(2, 0, 5, 5),
+    )
+
+    evaluation = summarize_duplicate_deal_results([primary_wins, heuristic_wins], deals=1, rotations_per_deal=2)
+
+    win = evaluation.paired("first_out_win", "Heuristic")
+    cards = evaluation.paired("cards_at_first_out", "Heuristic")
+    rank = evaluation.paired("rank", "Heuristic")
+    assert (win.average_advantage, win.comparisons) == (0.0, 2)
+    assert cards.average_advantage == ((4 - 0) + (0 - 2)) / 2
+    assert rank.average_advantage == ((3 - 1) + (1 - 2)) / 2
+    assert evaluation.paired("first_out_win", "Random").average_advantage == 0.5
+    assert evaluation.summary("Monte Carlo").average_cards_at_first_out == 1.0
+    assert evaluation.summary("Monte Carlo").win_rate == 0.5
 
 
 def test_duplicate_deal_evaluation_reports_progress() -> None:
@@ -1211,11 +1251,10 @@ def test_full_game_eval_summary_csvs_include_big_run_reporting_columns() -> None
         agent_csv = agent_path.read_text(encoding="utf-8")
         paired_csv = paired_path.read_text(encoding="utf-8")
 
-    assert "win_rate_standard_error" in agent_csv
-    assert "cards_left_standard_error" in agent_csv
+    assert "win_rate_standard_error,average_cards_at_first_out" in agent_csv
     assert "turns,forced_passes,single_legal_moves,immediate_wins,sampled_mc_decisions" in agent_csv
     assert "ci95_low,ci95_high,average_oracle_gap" in paired_csv
-    assert "CounterpartOracle" in paired_csv
+    assert "Monte Carlo,CounterpartOracle,first_out_win" in paired_csv
 
 
 def test_tune_eval_random_search_writes_ranked_candidate_reports() -> None:
@@ -1260,13 +1299,15 @@ def test_tune_eval_random_search_writes_ranked_candidate_reports() -> None:
                 "mode",
                 "score",
                 "target_baseline",
-                "average_advantage",
-                "standard_error",
-                "ci95_low",
-                "ci95_high",
-                "candidate_average_cards_left",
-                "candidate_cards_left_standard_error",
+                "win_advantage",
+                "win_advantage_standard_error",
+                "win_advantage_ci95_low",
+                "win_advantage_ci95_high",
+                "cards_at_first_out_advantage",
+                "cards_at_first_out_advantage_standard_error",
                 "candidate_win_rate",
+                "candidate_win_rate_standard_error",
+                "candidate_average_cards_at_first_out",
                 "candidate_rank",
                 "sampled_mc_decisions",
                 "samples_per_move",

@@ -6,7 +6,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
-from math import exp, isnan, nan, sqrt
+from math import comb, exp, isnan, nan, sqrt
+from operator import add, le
 from time import perf_counter
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, MutableMapping, Sequence
@@ -141,26 +142,27 @@ class SuitRun:
         raise ValueError(f"rank {rank} is not adjacent to run {self.low}-{self.high}")
 
     def played_mask(self, suit: Suit) -> int:
-        if not self.is_open:
-            return 0
-        assert self.low is not None and self.high is not None
-        base = SUIT_INDEX[suit] * 13
-        mask = 0
-        for rank in range(self.low, self.high + 1):
-            mask |= 1 << (base + rank - 1)
-        return mask
+        return run_masks(suit, self.low, self.high)[0]
 
     def legal_mask(self, suit: Suit) -> int:
-        if not self.is_open:
-            return card_bit(Card(suit, 7))
+        return run_masks(suit, self.low, self.high)[1]
 
-        assert self.low is not None and self.high is not None
-        mask = 0
-        if self.low > 1:
-            mask |= card_bit(Card(suit, self.low - 1))
-        if self.high < 13:
-            mask |= card_bit(Card(suit, self.high + 1))
-        return mask
+
+@lru_cache(maxsize=None)
+def run_masks(suit: Suit, low: int | None, high: int | None) -> tuple[int, int]:
+    """(played cards, next legal cards) masks for one suit's run; at most 4 * 92 distinct inputs."""
+    base = SUIT_INDEX[suit] * 13
+    if low is None or high is None:
+        return 0, 1 << (base + 6)
+    played = 0
+    for rank in range(low, high + 1):
+        played |= 1 << (base + rank - 1)
+    legal = 0
+    if low > 1:
+        legal |= 1 << (base + low - 2)
+    if high < 13:
+        legal |= 1 << (base + high)
+    return played, legal
 
 
 def table_played_mask(runs: Iterable[tuple[Suit, SuitRun]]) -> int:
@@ -924,6 +926,8 @@ class FullGameResult:
     turns_played: int
     timed_out: bool = False
     decision_traces: tuple["DecisionTrace", ...] = ()
+    # Hand sizes when the first player went out (final counts if nobody did).
+    first_out_hand_counts: tuple[int, int, int, int] | None = None
     decision_counts_by_seat: tuple[
         FullGameDecisionCounts,
         FullGameDecisionCounts,
@@ -962,10 +966,13 @@ class AgentFullGameSummary:
     seats_played: int
     win_rate: float
     win_rate_standard_error: float
-    average_cards_left: float
-    cards_left_standard_error: float
+    average_cards_at_first_out: float
+    cards_at_first_out_standard_error: float
     average_rank: float
     rank_standard_error: float
+    # Cards held when play stopped. Only last place has any, so this is mostly noise.
+    average_cards_left: float
+    cards_left_standard_error: float
     turns: int = 0
     forced_passes: int = 0
     single_legal_moves: int = 0
@@ -973,10 +980,18 @@ class AgentFullGameSummary:
     sampled_mc_decisions: int = 0
 
 
+# Paired metrics, oriented so a positive advantage means the primary agent did better:
+#   first_out_win       primary won minus baseline won (the solver's objective)
+#   cards_at_first_out  baseline's cards minus primary's when someone first went out
+#   rank                baseline's finishing rank minus primary's
+PAIRED_METRICS = ("first_out_win", "cards_at_first_out", "rank")
+
+
 @dataclass(frozen=True)
-class PairedCardAdvantage:
+class PairedComparison:
     primary_agent: str
     baseline_agent: str
+    metric: str
     comparisons: int
     average_advantage: float
     standard_error: float
@@ -998,10 +1013,22 @@ class DuplicateDealEvaluation:
     deals: int
     rotations_per_deal: int
     agent_summaries: tuple[AgentFullGameSummary, ...]
-    paired_card_advantages: tuple[PairedCardAdvantage, ...]
+    paired_comparisons: tuple[PairedComparison, ...]
     average_turns: float
     timeout_rate: float
     game_results: tuple[DuplicateDealGameResult, ...] = ()
+
+    def paired(self, metric: str, baseline_agent: str) -> PairedComparison:
+        for comparison in self.paired_comparisons:
+            if comparison.metric == metric and comparison.baseline_agent == baseline_agent:
+                return comparison
+        raise KeyError(f"no paired {metric} comparison against {baseline_agent}")
+
+    def summary(self, agent_name: str) -> AgentFullGameSummary:
+        for summary in self.agent_summaries:
+            if summary.agent_name == agent_name:
+                return summary
+        raise KeyError(f"no summary for {agent_name}")
 
 
 @dataclass(frozen=True)
@@ -1113,85 +1140,116 @@ def exact_holder_marginals(
     hand_counts: tuple[int | None, int | None, int | None, int | None] | None,
     hidden_cards: Iterable[Card] | None = None,
 ) -> dict[int, dict[Card, float]] | None:
+    """P(player holds card) under a uniform prior over deals consistent with the known hand counts.
+
+    Cards that the same set of opponents could hold are interchangeable, so assignments are
+    counted per group of such cards with multinomials rather than card by card. Counts are exact
+    integers until the final division.
+    """
     if hand_counts is None:
         return None
 
-    quota_players = tuple(
-        player
-        for player in possible_cards
-        if hand_counts[player] is not None
-    )
+    quota_players = tuple(player for player in possible_cards if hand_counts[player] is not None)
     if not quota_players:
         return None
-
-    quotas = tuple(hand_counts[player] for player in quota_players)
-    assert all(count is not None for count in quotas)
-    initial = tuple(int(count) for count in quotas)
-    if any(count < 0 for count in initial):
+    quotas = tuple(int(hand_counts[player]) for player in quota_players)  # type: ignore[arg-type]
+    if any(count < 0 for count in quotas):
         return None
 
     cards = sorted(hidden_cards if hidden_cards is not None else set().union(*possible_cards.values()))
-    holder_options: list[tuple[int, ...]] = []
+    groups: dict[tuple[int, ...], list[Card]] = {}
     for card in cards:
         holders = tuple(player for player in possible_cards if card in possible_cards[player])
         if not holders:
             return None
-        holder_options.append(holders)
+        groups.setdefault(holders, []).append(card)
 
-    quota_index = {player: index for index, player in enumerate(quota_players)}
+    # For each group: every way to split its cards among its holders, as
+    # (cards per holder, cards per quota player, number of labeled assignments).
+    # Splits that already exceed a quota can never complete, so they are dropped.
+    group_splits = [
+        (
+            holders,
+            group_cards,
+            [
+                split
+                for split in holder_splits(holders, len(group_cards), quota_players)
+                if all(take <= limit for take, limit in zip(split[1], quotas))
+            ],
+        )
+        for holders, group_cards in groups.items()
+    ]
 
-    def next_state(state: tuple[int, ...], holder: int) -> tuple[int, ...] | None:
-        index = quota_index.get(holder)
-        if index is None:
-            return state
-        if state[index] == 0:
-            return None
-        values = list(state)
-        values[index] -= 1
-        return tuple(values)
+    def quota_usage_ways(skip: int | None) -> dict[tuple[int, ...], int]:
+        usage: dict[tuple[int, ...], int] = {(0,) * len(quotas): 1}
+        for index, (_, _, splits) in enumerate(group_splits):
+            if index == skip:
+                continue
+            next_usage: dict[tuple[int, ...], int] = {}
+            for used, ways in usage.items():
+                for _, quota_take, split_ways in splits:
+                    combined = tuple(map(add, used, quota_take))
+                    if all(map(le, combined, quotas)):
+                        next_usage[combined] = next_usage.get(combined, 0) + ways * split_ways
+            usage = next_usage
+        return usage
 
-    @lru_cache(maxsize=None)
-    def ways_from(index: int, state: tuple[int, ...]) -> int:
-        if index == len(cards):
-            return 1 if all(value == 0 for value in state) else 0
-
-        total = 0
-        for holder in holder_options[index]:
-            state_after = next_state(state, holder)
-            if state_after is not None:
-                total += ways_from(index + 1, state_after)
-        return total
-
-    total_ways = ways_from(0, initial)
+    total_ways = quota_usage_ways(None).get(quotas, 0)
     if total_ways == 0:
         return None
 
-    prefix: list[dict[tuple[int, ...], int]] = [{initial: 1}]
-    for index, holders in enumerate(holder_options):
-        next_prefix: dict[tuple[int, ...], int] = {}
-        for state, count in prefix[index].items():
-            for holder in holders:
-                state_after = next_state(state, holder)
-                if state_after is not None and ways_from(index + 1, state_after):
-                    next_prefix[state_after] = next_prefix.get(state_after, 0) + count
-        prefix.append(next_prefix)
+    per_card_counts: dict[int, dict[tuple[int, ...], int]] = {player: {} for player in possible_cards}
+    for index, (holders, group_cards, splits) in enumerate(group_splits):
+        others = quota_usage_ways(index)
+        size = len(group_cards)
+        for holder_take, quota_take, split_ways in splits:
+            rest = others.get(tuple(limit - take for limit, take in zip(quotas, quota_take)), 0)
+            if not rest:
+                continue
+            for holder, take in zip(holders, holder_take):
+                if take:
+                    # assignments where one specific card of the group goes to this holder
+                    counts = per_card_counts[holder]
+                    counts[holders] = counts.get(holders, 0) + rest * split_ways * take // size
 
-    assignment_counts: dict[int, dict[Card, int]] = {player: {} for player in possible_cards}
-    for index, card in enumerate(cards):
-        for state, prefix_count in prefix[index].items():
-            for holder in holder_options[index]:
-                state_after = next_state(state, holder)
-                if state_after is None:
-                    continue
-                completion_count = ways_from(index + 1, state_after)
-                if completion_count:
-                    player_counts = assignment_counts[holder]
-                    player_counts[card] = player_counts.get(card, 0) + prefix_count * completion_count
+    marginals: dict[int, dict[Card, float]] = {player: {} for player in possible_cards}
+    for card in cards:
+        holders = tuple(player for player in possible_cards if card in possible_cards[player])
+        for holder in holders:
+            count = per_card_counts[holder].get(holders, 0)
+            if count:
+                marginals[holder][card] = count / total_ways
+    return marginals
 
-    return {
-        player: {card: count / total_ways for card, count in player_counts.items()}
-        for player, player_counts in assignment_counts.items()
-    }
+
+@lru_cache(maxsize=4096)
+def holder_splits(
+    holders: tuple[int, ...],
+    size: int,
+    quota_players: tuple[int, ...],
+) -> tuple[tuple[tuple[int, ...], tuple[int, ...], int], ...]:
+    """Every split of `size` labeled cards among `holders`, with its multinomial count."""
+    def compositions(total: int, parts: int) -> Iterable[tuple[int, ...]]:
+        if parts == 1:
+            yield (total,)
+            return
+        for first in range(total + 1):
+            for rest in compositions(total - first, parts - 1):
+                yield (first, *rest)
+
+    splits = []
+    for holder_take in compositions(size, len(holders)):
+        ways = 1
+        remaining = size
+        for take in holder_take:
+            ways *= comb(remaining, take)
+            remaining -= take
+        quota_take = tuple(
+            sum(take for holder, take in zip(holders, holder_take) if holder == quota_player)
+            for quota_player in quota_players
+        )
+        splits.append((holder_take, quota_take, ways))
+    return tuple(splits)
 
 
 def sample_hidden_deal(
@@ -2910,6 +2968,7 @@ def simulate_full_game_to_completion(
     deck = deck or frozenset(card for hand in current_hands.values() for card in hand)
     state = initial_state_for_hands(current_hands)
     finish_order: list[int] = []
+    first_out_counts: tuple[int, int, int, int] | None = None
     decision_traces: list[DecisionTrace] = []
     decision_counts = [FullGameDecisionCounts() for _ in range(4)]
     policy_cache: InformationLimitedPolicyCache = BoundedInformationLimitedPolicyCache()
@@ -2928,6 +2987,7 @@ def simulate_full_game_to_completion(
                 timed_out=False,
                 decision_traces=decision_traces,
                 decision_counts_by_seat=decision_counts,
+                first_out_hand_counts=first_out_counts,
             )
         if turns_played == max_turns:
             break
@@ -2984,6 +3044,8 @@ def simulate_full_game_to_completion(
         state, current_hands = apply_known_play(state, current_hands, player, card)
         if not current_hands[player] and player not in finish_order:
             finish_order.append(player)
+            if first_out_counts is None:
+                first_out_counts = hand_count_tuple(current_hands)
 
         next_player = next_active_player(state.current_player, current_hands)
         if next_player is not None and next_player != state.current_player:
@@ -3002,6 +3064,7 @@ def simulate_full_game_to_completion(
         timed_out=True,
         decision_traces=decision_traces,
         decision_counts_by_seat=decision_counts,
+        first_out_hand_counts=first_out_counts,
     )
 
 
@@ -3013,6 +3076,7 @@ def finalized_full_game_result(
     timed_out: bool,
     decision_traces: Sequence[DecisionTrace] = (),
     decision_counts_by_seat: Sequence[FullGameDecisionCounts] = (FullGameDecisionCounts(),) * 4,
+    first_out_hand_counts: tuple[int, int, int, int] | None = None,
 ) -> FullGameResult:
     ranks = [4, 4, 4, 4]
     seen: set[int] = set()
@@ -3048,6 +3112,7 @@ def finalized_full_game_result(
         timed_out=timed_out,
         decision_traces=completed_traces,
         decision_counts_by_seat=tuple(decision_counts_by_seat),  # type: ignore[arg-type]
+        first_out_hand_counts=first_out_hand_counts or final_hand_counts,
     )
 
 
@@ -3179,7 +3244,22 @@ def evaluate_duplicate_deal_seat_rotation(
 
 
 DECISION_COUNT_FIELDS = ("turns", "forced_passes", "single_legal_moves", "immediate_wins", "sampled_mc_decisions")
-SUMMARY_TOTAL_FIELDS = ("seats", "wins", "cards_left", "rank", *DECISION_COUNT_FIELDS)
+
+
+def seat_outcomes(result: FullGameResult, seat: int) -> dict[str, float]:
+    first_out_counts = result.first_out_hand_counts or result.final_hand_counts
+    return {
+        "win": 1.0 if result.winner == seat else 0.0,
+        "cards_at_first_out": float(first_out_counts[seat]),
+        "rank": float(result.ranks_by_seat[seat]),
+        "cards_left": float(result.final_hand_counts[seat]),
+    }
+
+
+def paired_advantage(metric: str, primary: Mapping[str, float], baseline: Mapping[str, float]) -> float:
+    if metric == "first_out_win":
+        return primary["win"] - baseline["win"]
+    return baseline[metric] - primary[metric]
 
 
 def summarize_duplicate_deal_results(
@@ -3189,81 +3269,68 @@ def summarize_duplicate_deal_results(
     primary_agent_name: str = DEFAULT_MONTE_CARLO_AGENT_NAME,
     game_results: Sequence[DuplicateDealGameResult] = (),
 ) -> DuplicateDealEvaluation:
-    totals: dict[str, dict[str, float]] = {}
-    samples_by_agent: dict[str, dict[str, list[float]]] = {}
-    paired: dict[str, list[float]] = {}
-    turns_total = 0
-    timeouts = 0
+    outcomes_by_agent: dict[str, dict[str, list[float]]] = {}
+    decision_totals: dict[str, dict[str, int]] = {}
+    paired: dict[tuple[str, str], list[float]] = {}
 
     for result in results:
-        turns_total += result.turns_played
-        if result.timed_out:
-            timeouts += 1
-
-        primary_cards_left: int | None = None
+        seat_values = [seat_outcomes(result, seat) for seat in range(4)]
         for seat, agent_name in enumerate(result.agent_names_by_seat):
-            bucket = totals.setdefault(agent_name, dict.fromkeys(SUMMARY_TOTAL_FIELDS, 0.0))
-            decision_counts = result.decision_counts_by_seat[seat]
-            bucket["seats"] += 1.0
-            bucket["wins"] += 1.0 if result.winner == seat else 0.0
-            bucket["cards_left"] += result.final_hand_counts[seat]
-            bucket["rank"] += result.ranks_by_seat[seat]
+            agent_outcomes = outcomes_by_agent.setdefault(agent_name, {})
+            for name, value in seat_values[seat].items():
+                agent_outcomes.setdefault(name, []).append(value)
+            totals = decision_totals.setdefault(agent_name, dict.fromkeys(DECISION_COUNT_FIELDS, 0))
             for name in DECISION_COUNT_FIELDS:
-                bucket[name] += getattr(decision_counts, name)
-            agent_samples = samples_by_agent.setdefault(
-                agent_name,
-                {"wins": [], "cards_left": [], "rank": []},
-            )
-            agent_samples["wins"].append(1.0 if result.winner == seat else 0.0)
-            agent_samples["cards_left"].append(float(result.final_hand_counts[seat]))
-            agent_samples["rank"].append(float(result.ranks_by_seat[seat]))
-            if agent_name == primary_agent_name:
-                primary_cards_left = result.final_hand_counts[seat]
+                totals[name] += getattr(result.decision_counts_by_seat[seat], name)
 
-        if primary_cards_left is None:
+        if primary_agent_name not in result.agent_names_by_seat:
             continue
+        primary = seat_values[result.agent_names_by_seat.index(primary_agent_name)]
         for seat, agent_name in enumerate(result.agent_names_by_seat):
             if agent_name == primary_agent_name:
                 continue
-            paired.setdefault(agent_name, []).append(result.final_hand_counts[seat] - primary_cards_left)
+            for metric in PAIRED_METRICS:
+                paired.setdefault((metric, agent_name), []).append(
+                    paired_advantage(metric, primary, seat_values[seat])
+                )
 
-    summaries: list[AgentFullGameSummary] = []
-    for agent_name, bucket in sorted(totals.items()):
-        seats = int(bucket["seats"])
-        if seats == 0:
-            continue
-        samples = samples_by_agent[agent_name]
+    summaries = []
+    for agent_name, outcomes in sorted(outcomes_by_agent.items()):
+        seats = len(outcomes["win"])
         summaries.append(
             AgentFullGameSummary(
                 agent_name=agent_name,
                 seats_played=seats,
-                win_rate=bucket["wins"] / seats,
-                win_rate_standard_error=standard_error(samples["wins"]),
-                average_cards_left=bucket["cards_left"] / seats,
-                cards_left_standard_error=standard_error(samples["cards_left"]),
-                average_rank=bucket["rank"] / seats,
-                rank_standard_error=standard_error(samples["rank"]),
-                **{name: int(bucket[name]) for name in DECISION_COUNT_FIELDS},
+                win_rate=sum(outcomes["win"]) / seats,
+                win_rate_standard_error=standard_error(outcomes["win"]),
+                average_cards_at_first_out=sum(outcomes["cards_at_first_out"]) / seats,
+                cards_at_first_out_standard_error=standard_error(outcomes["cards_at_first_out"]),
+                average_rank=sum(outcomes["rank"]) / seats,
+                rank_standard_error=standard_error(outcomes["rank"]),
+                average_cards_left=sum(outcomes["cards_left"]) / seats,
+                cards_left_standard_error=standard_error(outcomes["cards_left"]),
+                **decision_totals[agent_name],
             )
         )
 
-    advantages: list[PairedCardAdvantage] = []
-    for baseline, differences in sorted(paired.items()):
-        count = len(differences)
-        if count == 0:
-            continue
-        average = sum(differences) / count
-        standard_error_value = standard_error(differences)
-        ci_radius = 1.96 * standard_error_value
-        advantages.append(
-            PairedCardAdvantage(
+    comparisons = []
+    def comparison_order(item: tuple[tuple[str, str], list[float]]) -> tuple[int, str]:
+        (metric, baseline), _ = item
+        return PAIRED_METRICS.index(metric), baseline
+
+    for (metric, baseline), differences in sorted(paired.items(), key=comparison_order):
+        average = sum(differences) / len(differences)
+        error = standard_error(differences)
+        comparisons.append(
+            PairedComparison(
                 primary_agent=primary_agent_name,
                 baseline_agent=baseline,
-                comparisons=count,
+                metric=metric,
+                comparisons=len(differences),
                 average_advantage=average,
-                standard_error=standard_error_value,
-                ci95_low=average - ci_radius,
-                ci95_high=average + ci_radius,
+                standard_error=error,
+                ci95_low=average - 1.96 * error,
+                ci95_high=average + 1.96 * error,
             )
         )
 
@@ -3273,9 +3340,9 @@ def summarize_duplicate_deal_results(
         deals=deals,
         rotations_per_deal=rotations_per_deal,
         agent_summaries=tuple(summaries),
-        paired_card_advantages=tuple(advantages),
-        average_turns=turns_total / games if games else 0.0,
-        timeout_rate=timeouts / games if games else 0.0,
+        paired_comparisons=tuple(comparisons),
+        average_turns=sum(result.turns_played for result in results) / games if games else 0.0,
+        timeout_rate=sum(1 for result in results if result.timed_out) / games if games else 0.0,
         game_results=tuple(game_results),
     )
 

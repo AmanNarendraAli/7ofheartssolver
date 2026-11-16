@@ -86,20 +86,6 @@ def candidate_agents(
     )
 
 
-def paired_advantage_against(evaluation: Any, baseline: str) -> Any:
-    for advantage in evaluation.paired_card_advantages:
-        if advantage.baseline_agent == baseline:
-            return advantage
-    raise ValueError(f"missing paired advantage against {baseline}")
-
-
-def agent_summary(evaluation: Any, agent_name: str) -> Any:
-    for summary in evaluation.agent_summaries:
-        if summary.agent_name == agent_name:
-            return summary
-    raise ValueError(f"missing summary for {agent_name}")
-
-
 def format_float(value: float) -> str:
     return f"{value:.6f}"
 
@@ -113,13 +99,15 @@ def write_candidate_reports(rows: Sequence[dict[str, Any]], run_dir: Path) -> tu
         "mode",
         "score",
         "target_baseline",
-        "average_advantage",
-        "standard_error",
-        "ci95_low",
-        "ci95_high",
-        "candidate_average_cards_left",
-        "candidate_cards_left_standard_error",
+        "win_advantage",
+        "win_advantage_standard_error",
+        "win_advantage_ci95_low",
+        "win_advantage_ci95_high",
+        "cards_at_first_out_advantage",
+        "cards_at_first_out_advantage_standard_error",
         "candidate_win_rate",
+        "candidate_win_rate_standard_error",
+        "candidate_average_cards_at_first_out",
         "candidate_rank",
         "sampled_mc_decisions",
         "samples_per_move",
@@ -223,20 +211,24 @@ def run_tuning(args: argparse.Namespace) -> tuple[Path, tuple[Path, ...]]:
             cards_per_suit=args.cards_per_suit,
             workers=args.workers,
         )
-        advantage = paired_advantage_against(evaluation, TARGET_BASELINE)
-        summary = agent_summary(evaluation, DEFAULT_MONTE_CARLO_AGENT_NAME)
+        # Score is the paired first-out win-rate advantage over the stock heuristic.
+        advantage = evaluation.paired("first_out_win", TARGET_BASELINE)
+        cards_advantage = evaluation.paired("cards_at_first_out", TARGET_BASELINE)
+        summary = evaluation.summary(DEFAULT_MONTE_CARLO_AGENT_NAME)
         row = {
             "candidate_id": candidate_id,
             "mode": args.mode,
             "score": format_float(advantage.average_advantage),
             "target_baseline": TARGET_BASELINE,
-            "average_advantage": format_float(advantage.average_advantage),
-            "standard_error": format_float(advantage.standard_error),
-            "ci95_low": format_float(advantage.ci95_low),
-            "ci95_high": format_float(advantage.ci95_high),
-            "candidate_average_cards_left": format_float(summary.average_cards_left),
-            "candidate_cards_left_standard_error": format_float(summary.cards_left_standard_error),
+            "win_advantage": format_float(advantage.average_advantage),
+            "win_advantage_standard_error": format_float(advantage.standard_error),
+            "win_advantage_ci95_low": format_float(advantage.ci95_low),
+            "win_advantage_ci95_high": format_float(advantage.ci95_high),
+            "cards_at_first_out_advantage": format_float(cards_advantage.average_advantage),
+            "cards_at_first_out_advantage_standard_error": format_float(cards_advantage.standard_error),
             "candidate_win_rate": format_float(summary.win_rate),
+            "candidate_win_rate_standard_error": format_float(summary.win_rate_standard_error),
+            "candidate_average_cards_at_first_out": format_float(summary.average_cards_at_first_out),
             "candidate_rank": format_float(summary.average_rank),
             "sampled_mc_decisions": summary.sampled_mc_decisions,
             "samples_per_move": samples_per_move,
@@ -251,7 +243,7 @@ def run_tuning(args: argparse.Namespace) -> tuple[Path, tuple[Path, ...]]:
         ):
             print(
                 f"[{index + 1}/{len(weights_by_candidate)}] {candidate_id} "
-                f"advantage={advantage.average_advantage:+.4f} "
+                f"win_advantage={advantage.average_advantage:+.4f} "
                 f"ci95=[{advantage.ci95_low:+.4f},{advantage.ci95_high:+.4f}]",
                 flush=True,
             )
