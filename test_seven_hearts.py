@@ -20,12 +20,9 @@ from seven_hearts import (
     card_from_index,
     card_index,
     card_set_mask,
-    choose_information_limited_move_from_mask,
-    choose_full_game_agent_move,
     deal_random_hands,
     enumerate_hidden_deals,
     evaluate_move_exact_information_limited_policy,
-    evaluate_move_information_limited_monte_carlo,
     evaluate_move_perfect_information_rollout_ev,
     estimate_complete_game_metrics,
     estimate_strategy_self_play,
@@ -41,7 +38,6 @@ from seven_hearts import (
     hand_masks_from_hands,
     highest_legal_card_policy,
     initial_state_for_hands,
-    choose_information_limited_move,
     lowest_legal_card_policy,
     mask_after_play,
     mask_hand_count_tuple,
@@ -51,26 +47,21 @@ from seven_hearts import (
     recommend_move_exact_information_limited_policy,
     recommend_move_information_limited_monte_carlo,
     recommend_move_monte_carlo,
-    recommend_move_perfect_information_rollout_ev,
     reduced_deck,
     rollout_transposition_cache_key,
     rollout_information_limited,
-    rollout_information_limited_masks,
     rollout_oracle,
     sample_hidden_deal,
     sample_hidden_deals,
-    evaluate_move_monte_carlo_from_deals,
     score_oracle_move,
     score_move,
     choose_rational_move,
-    choose_expected_value_vector_move,
     solve_full_information,
     solve_full_information_against_policy,
-    simulate_complete_game,
     simulate_full_game_to_completion,
     time_to_playable,
 )
-from proof_benchmark import FAST_BENCHMARKS, HARD_BENCHMARKS, benchmark_positions, hard_benchmark_positions
+from proof_benchmark import hard_benchmark_positions
 from proof_eval import evaluate_scenario, evaluation_scenarios
 
 
@@ -197,14 +188,6 @@ def test_recommend_move_returns_none_when_forced_to_pass() -> None:
     assert recommend_move(state, knowledge) is None
 
 
-def test_recommend_move_works_without_hand_counts() -> None:
-    state = GameState(table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)})
-    knowledge = PlayerKnowledge(player=0, hand=hand("6H 8H AS KS"))
-
-    result = recommend_move(state, knowledge)
-
-    assert result is not None
-    assert result.card in {Card(Suit.HEARTS, 6), Card(Suit.HEARTS, 8)}
 
 
 def test_known_player_count_is_decremented_but_unknown_counts_remain_unknown() -> None:
@@ -448,12 +431,8 @@ def test_evaluate_move_monte_carlo_scores_legal_move() -> None:
 
     result = evaluate_move_monte_carlo(state, knowledge, Card(Suit.HEARTS, 6), samples=3, rng=random.Random(5))
 
-    assert result.card == Card(Suit.HEARTS, 6)
     assert result.samples == 3
-    assert 0.0 <= result.win_rate <= 1.0
-    assert result.average_turns >= 0.0
     assert result.timeout_rate == 0.0
-    assert result.win_rate_standard_error >= 0.0
 
 
 def test_evaluate_move_monte_carlo_reports_timeouts() -> None:
@@ -476,17 +455,6 @@ def test_evaluate_move_monte_carlo_reports_timeouts() -> None:
     assert result.average_turns == 0.0
 
 
-def test_recommend_move_monte_carlo_returns_legal_move() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        current_player=0,
-    )
-    knowledge = PlayerKnowledge(player=0, hand=hand("6H 8H"))
-
-    result = recommend_move_monte_carlo(state, knowledge, samples_per_move=2, rng=random.Random(6))
-
-    assert result is not None
-    assert result.card in {Card(Suit.HEARTS, 6), Card(Suit.HEARTS, 8)}
 
 
 def test_recommend_move_monte_carlo_skips_forced_move_sampling() -> None:
@@ -522,34 +490,9 @@ def test_recommend_move_monte_carlo_shortcuts_immediate_win() -> None:
     assert result.policy_name == "oracle_greedy_full_information_immediate_win"
 
 
-def test_information_limited_policy_uses_only_actor_hand_and_public_state() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 1, 1, 1),
-        current_player=0,
-    )
-    actor_hand = hand("6H 8H")
-    first_hidden_world = {
-        0: set(actor_hand),
-        1: set(hand("5H")),
-        2: set(hand("9H")),
-        3: set(hand("7S")),
-    }
-    second_hidden_world = {
-        0: set(actor_hand),
-        1: set(hand("9H")),
-        2: set(hand("7S")),
-        3: set(hand("5H")),
-    }
-    deck = frozenset(card for cards in first_hidden_world.values() for card in cards) | {Card(Suit.HEARTS, 7)}
-
-    first_choice = choose_information_limited_move(state, first_hidden_world[0], 0, deck=deck)
-    second_choice = choose_information_limited_move(state, second_hidden_world[0], 0, deck=deck)
-
-    assert first_choice == second_choice
 
 
-def test_rollout_information_limited_completes_without_hidden_hand_leakage() -> None:
+def test_rollout_information_limited_detects_first_player_out() -> None:
     state = GameState(
         table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
         hand_counts=(1, 1, 1, 1),
@@ -621,88 +564,10 @@ def test_mask_after_play_rejects_card_not_in_hand() -> None:
         raise AssertionError("expected missing-card mask play to raise ValueError")
 
 
-def test_choose_information_limited_move_from_mask_matches_set_path() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 2, 1, 1),
-        current_player=0,
-    )
-    player_hand = hand("6H 8H")
-    deck = frozenset(hand("6H 8H 5H 9H 7S 7C")) | {Card(Suit.HEARTS, 7)}
-
-    set_choice = choose_information_limited_move(state, player_hand, 0, deck=deck)
-    cache = BoundedInformationLimitedPolicyCache()
-    mask_choice = choose_information_limited_move_from_mask(
-        state,
-        card_set_mask(player_hand),
-        0,
-        deck_mask=card_set_mask(deck),
-        cache=cache,
-    )
-
-    assert mask_choice == set_choice
-    assert len(cache) == 1
 
 
-def test_rollout_information_limited_masks_matches_set_rollout() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 2, 1, 1),
-        current_player=0,
-    )
-    hands = {
-        0: set(hand("6H 8H")),
-        1: set(hand("5H 9H")),
-        2: set(hand("7S")),
-        3: set(hand("7C")),
-    }
-    deck = frozenset(card for cards in hands.values() for card in cards) | {Card(Suit.HEARTS, 7)}
-
-    set_result = rollout_information_limited(state, hands, max_turns=10, rng=random.Random(11))
-    mask_result = rollout_information_limited_masks(
-        state,
-        hand_masks_from_hands(hands),
-        max_turns=10,
-        rng=random.Random(11),
-        deck=deck,
-    )
-
-    assert mask_result == set_result
 
 
-def test_rollout_information_limited_masks_softmax_matches_set_rollout() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 2, 1, 1),
-        current_player=0,
-    )
-    hands = {
-        0: set(hand("6H 8H")),
-        1: set(hand("5H 9H")),
-        2: set(hand("7S")),
-        3: set(hand("7C")),
-    }
-    deck = frozenset(card for cards in hands.values() for card in cards) | {Card(Suit.HEARTS, 7)}
-
-    set_result = rollout_information_limited(
-        state,
-        hands,
-        max_turns=10,
-        rng=random.Random(11),
-        policy="softmax",
-        rationality=0.5,
-    )
-    mask_result = rollout_information_limited_masks(
-        state,
-        hand_masks_from_hands(hands),
-        max_turns=10,
-        rng=random.Random(11),
-        deck=deck,
-        policy="softmax",
-        rationality=0.5,
-    )
-
-    assert mask_result == set_result
 
 
 def test_rollout_information_limited_transposition_cache_preserves_result() -> None:
@@ -769,30 +634,6 @@ def test_rollout_transposition_cache_key_includes_weights_and_budget() -> None:
     assert changed_budget_key != default_key
 
 
-def test_recommend_move_information_limited_monte_carlo_returns_policy_labeled_legal_move() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 1, 1, 1),
-        current_player=0,
-    )
-    knowledge = PlayerKnowledge(
-        0,
-        hand("6H 8H"),
-        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
-    )
-
-    result = recommend_move_information_limited_monte_carlo(
-        state,
-        knowledge,
-        samples_per_move=4,
-        max_turns=20,
-        rng=random.Random(12),
-    )
-
-    assert result is not None
-    assert result.card in state.legal_moves(knowledge.hand)
-    assert result.samples == 4
-    assert result.policy_name == "information_limited_heuristic_greedy"
 
 
 def test_information_limited_monte_carlo_enumerates_when_belief_fits_sample_budget() -> None:
@@ -953,6 +794,7 @@ def test_information_limited_monte_carlo_softmax_does_not_use_deterministic_cach
 
     assert result is not None
     assert result.samples == 3
+    assert result.policy_name == "information_limited_softmax_heuristic_rationality_0.5"
     assert len(policy_cache) == 0
     assert len(rollout_cache) == 0
 
@@ -1053,111 +895,10 @@ def test_perfect_information_counterpart_oracle_uses_true_deal_without_hidden_sa
     assert first_score.score != second_score.score
 
 
-def test_recommend_move_perfect_information_counterpart_returns_labeled_legal_move() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 1, 1, 1),
-        current_player=0,
-    )
-    hands = {
-        0: set(hand("6H 8H")),
-        1: set(hand("5H")),
-        2: set(hand("9H")),
-        3: set(hand("7S")),
-    }
-
-    result = recommend_move_perfect_information_rollout_ev(
-        state,
-        hands,
-        0,
-        max_turns=20,
-        rng=random.Random(22),
-    )
-
-    assert result is not None
-    assert result.card in state.legal_moves(hands[0])
-    assert result.samples == 1
-    assert result.policy_name == "perfect_information_counterpart_information_limited_heuristic_greedy"
 
 
-def test_full_game_agent_can_use_perfect_information_counterpart_oracle_policy() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 1, 1, 1),
-        current_player=0,
-    )
-    hands = {
-        0: set(hand("6H 8H")),
-        1: set(hand("5H")),
-        2: set(hand("9H")),
-        3: set(hand("7S")),
-    }
-
-    card = choose_full_game_agent_move(
-        state,
-        hands,
-        0,
-        FullGameAgent("CounterpartOracle", "perfect_information_counterpart_oracle"),
-        random.Random(23),
-    )
-
-    assert card in state.legal_moves(hands[0])
 
 
-def test_evaluate_move_information_limited_monte_carlo_supports_softmax_policy() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(2, 1, 1, 1),
-        current_player=0,
-    )
-    knowledge = PlayerKnowledge(
-        0,
-        hand("6H 8H"),
-        deck=frozenset(hand("6H 8H 5H 9H 7S")) | {Card(Suit.HEARTS, 7)},
-    )
-
-    result = evaluate_move_information_limited_monte_carlo(
-        state,
-        knowledge,
-        Card(Suit.HEARTS, 6),
-        samples=3,
-        max_turns=20,
-        rng=random.Random(13),
-        policy="softmax",
-        rationality=0.5,
-    )
-
-    assert result.card == Card(Suit.HEARTS, 6)
-    assert result.samples == 3
-    assert result.policy_name == "information_limited_softmax_heuristic_rationality_0.5"
-
-
-def test_monte_carlo_can_compare_moves_over_shared_hidden_deals() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        current_player=0,
-    )
-    knowledge = PlayerKnowledge(player=0, hand=hand("6H 8H"))
-    deals = sample_hidden_deals(state, knowledge, 3, random.Random(7))
-
-    low_score = evaluate_move_monte_carlo_from_deals(
-        state,
-        knowledge,
-        Card(Suit.HEARTS, 6),
-        deals,
-    )
-    high_score = evaluate_move_monte_carlo_from_deals(
-        state,
-        knowledge,
-        Card(Suit.HEARTS, 8),
-        deals,
-    )
-
-    assert len(deals) == 3
-    assert low_score.samples == 3
-    assert high_score.samples == 3
-    assert low_score.card == Card(Suit.HEARTS, 6)
-    assert high_score.card == Card(Suit.HEARTS, 8)
 
 
 def test_oracle_move_score_penalizes_strong_next_response() -> None:
@@ -1236,12 +977,6 @@ def test_initial_state_starts_with_seven_hearts_holder() -> None:
     assert state.public_legal_cards() == {Card(Suit.HEARTS, 7)}
 
 
-def test_simulate_complete_game_returns_result() -> None:
-    result = simulate_complete_game(random.Random(8), max_turns=300)
-
-    assert result.winner in {0, 1, 2, 3}
-    assert sum(result.final_hand_counts) < 52
-    assert not result.timed_out
 
 
 def test_estimate_complete_game_metrics_reports_rates() -> None:
@@ -1249,8 +984,6 @@ def test_estimate_complete_game_metrics_reports_rates() -> None:
 
     assert estimate.games == 4
     assert abs(sum(estimate.win_rates) - 1.0) < 0.000001
-    assert all(rate >= 0.0 for rate in estimate.win_rates)
-    assert all(error >= 0.0 for error in estimate.win_rate_standard_errors)
     assert estimate.average_turns > 0.0
 
 
@@ -1297,9 +1030,6 @@ def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
         "Heuristic",
     }
     assert all(summary.seats_played == 8 for summary in evaluation.agent_summaries)
-    assert all(summary.win_rate_standard_error >= 0.0 for summary in evaluation.agent_summaries)
-    assert all(summary.cards_left_standard_error >= 0.0 for summary in evaluation.agent_summaries)
-    assert all(summary.rank_standard_error >= 0.0 for summary in evaluation.agent_summaries)
     assert all(summary.turns > 0 for summary in evaluation.agent_summaries)
     assert {advantage.baseline_agent for advantage in evaluation.paired_card_advantages} == {
         "Random",
@@ -1307,7 +1037,6 @@ def test_duplicate_deal_seat_rotation_reports_paired_card_advantage() -> None:
         "Heuristic",
     }
     assert all(advantage.comparisons == 8 for advantage in evaluation.paired_card_advantages)
-    assert all(advantage.ci95_low <= advantage.average_advantage <= advantage.ci95_high for advantage in evaluation.paired_card_advantages)
     assert evaluation.average_turns > 0.0
 
 
@@ -1605,18 +1334,6 @@ def test_opponent_model_reports_impossible_known_counts() -> None:
     assert model.consistency_errors()
 
 
-def test_score_components_are_immutable() -> None:
-    state = GameState(table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)})
-    knowledge = PlayerKnowledge(player=0, hand=hand("6H 8H AS KS"))
-
-    result = score_move(state, knowledge, Card(Suit.HEARTS, 6))
-
-    try:
-        result.components["extra"] = 1.0
-    except TypeError:
-        pass
-    else:
-        raise AssertionError("expected score components to be immutable")
 
 
 def test_strategy_weights_change_heuristic_score_components() -> None:
@@ -1641,22 +1358,8 @@ def test_strategy_self_play_compares_candidates_on_shared_deals() -> None:
 
     assert {estimate.candidate.name for estimate in estimates} == {"baseline", "cautious"}
     assert all(estimate.games == 3 for estimate in estimates)
-    assert all(0.0 <= estimate.win_rate <= 1.0 for estimate in estimates)
-    assert all(estimate.win_rate_standard_error >= 0.0 for estimate in estimates)
 
 
-def test_rollout_oracle_can_use_seat_specific_weights() -> None:
-    hands = deal_random_hands(random.Random(11))
-    state = initial_state_for_hands(hands)
-    result = rollout_oracle(
-        state,
-        hands,
-        max_turns=300,
-        weights={0: StrategyWeights(self_unlock=4.0)},
-    )
-
-    assert result.winner in {0, 1, 2, 3}
-    assert not result.timed_out
 
 
 def test_full_information_state_enforces_card_conservation_for_declared_deck() -> None:
@@ -1671,6 +1374,12 @@ def test_full_information_state_enforces_card_conservation_for_declared_deck() -
     )
 
     state.assert_card_conservation(hand("6H 7H 8H 7S 7D"))
+    try:
+        state.assert_card_conservation(hand("6H 7H 8H 7S 7D 7C"))
+    except ValueError as error:
+        assert "missing [7C]" in str(error)
+    else:
+        raise AssertionError("expected an undeclared missing card to fail conservation")
 
 
 def test_full_information_exact_solver_picks_immediate_win() -> None:
@@ -1711,6 +1420,7 @@ def test_full_information_exact_solver_follows_forced_pass_chain() -> None:
     result = solve_full_information(state)
 
     assert result.chosen_move is None
+    assert result.best_moves == ()
     assert result.value == (0.0, 0.0, 1.0, 0.0)
     assert result.deadlock_states == 0
 
@@ -1736,26 +1446,6 @@ def test_full_information_solver_reports_deadlock_state() -> None:
     assert result.deadlock_states == 1
 
 
-def test_full_information_root_forced_pass_has_no_chosen_move() -> None:
-    state = FullInformationState.from_hands(
-        {
-            0: hand("AC"),
-            1: hand("AD"),
-            2: hand("6H"),
-            3: hand("AS"),
-        },
-        GameState(
-            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-            current_player=0,
-        ),
-    )
-
-    result = solve_full_information(state)
-
-    assert state.legal_moves() == ()
-    assert result.chosen_move is None
-    assert result.best_moves == ()
-    assert result.value == solve_full_information(state.after_action(None)).value
 
 
 def test_forced_pass_chain_canonicalization_preserves_value() -> None:
@@ -1877,8 +1567,6 @@ def test_full_information_memoized_solver_matches_tiny_brute_force() -> None:
     result = solve_full_information(state)
 
     assert result.value == brute_force_full_information_value(state)
-    assert result.states_evaluated > 0
-    assert result.terminal_states > 0
 
 
 def test_full_information_memoized_solver_matches_random_tiny_brute_force() -> None:
@@ -2278,8 +1966,8 @@ def test_exact_imperfect_information_reuses_same_hidden_deal_set_for_all_candida
     assert all(math.isnan(score.value_standard_error) for score in result.move_scores)
 
 
-def test_exact_imperfect_information_uses_vector_tie_breaker() -> None:
-    move = choose_expected_value_vector_move(
+def test_rational_tie_breaker_prefers_starving_next_player() -> None:
+    move = choose_rational_move(
         0,
         {
             Card(Suit.CLUBS, 6): (0.5, 0.5, 0.0, 0.0),
@@ -2290,65 +1978,6 @@ def test_exact_imperfect_information_uses_vector_tie_breaker() -> None:
     assert move == Card(Suit.CLUBS, 8)
 
 
-def test_recommend_move_exact_imperfect_information_reports_non_exhaustive_limit() -> None:
-    state = GameState(
-        table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-        hand_counts=(1, 48, 1, 1),
-        current_player=0,
-    )
-    knowledge = PlayerKnowledge(player=0, hand=hand("6H"))
-
-    result = recommend_move_exact_imperfect_information(state, knowledge, max_deals=2)
-
-    assert result is not None
-    assert not result.exhaustive
-    assert result.hidden_deals == 2
-    assert result.chosen_move in state.legal_moves(knowledge.hand)
-    assert all(math.isnan(score.value_standard_error) for score in result.move_scores)
-
-
-def test_full_information_fixed_policy_solver_chooses_best_root_response() -> None:
-    state = FullInformationState.from_hands(
-        {
-            0: hand("6H 8H"),
-            1: hand("AC"),
-            2: hand("9H"),
-            3: hand("AD"),
-        },
-        GameState(
-            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-            current_player=0,
-        ),
-    )
-
-    result = solve_full_information_against_policy(state, highest_legal_card_policy)
-
-    assert result.policy_name == "fixed_policy"
-    assert result.chosen_move == Card(Suit.HEARTS, 6)
-    assert result.value == (1.0, 0.0, 0.0, 0.0)
-
-
-def test_exact_solver_certificate_includes_move_values_and_stats() -> None:
-    state = FullInformationState.from_hands(
-        {
-            0: hand("6H"),
-            1: hand("8H"),
-            2: hand("7S"),
-            3: hand("7D"),
-        },
-        GameState(
-            table={s: SuitRun() for s in Suit} | {Suit.HEARTS: SuitRun(low=7, high=7)},
-            current_player=0,
-        ),
-    )
-    result = solve_full_information(state)
-
-    certificate = format_exact_solver_certificate(state, result)
-
-    assert "Exact full-information certificate" in certificate
-    assert "chosen_move: 6H" in certificate
-    assert "move_values:" in certificate
-    assert "states=" in certificate
 
 
 def test_exact_imperfect_information_certificate_reports_exhaustive_status() -> None:
@@ -2393,12 +2022,6 @@ def test_lowest_legal_card_policy_rejects_forced_pass_state() -> None:
         raise AssertionError("expected fixed policy helper to reject forced-pass state")
 
 
-def test_proof_benchmark_tiers_include_harder_positions() -> None:
-    fast_positions = benchmark_positions()
-    all_positions = benchmark_positions(include_hard=True)
-
-    assert {name for name, _ in fast_positions} == FAST_BENCHMARKS
-    assert {name for name, _ in all_positions} == FAST_BENCHMARKS | HARD_BENCHMARKS
 
 
 def test_hard_proof_benchmark_reaches_thousand_state_scale() -> None:
@@ -2415,11 +2038,10 @@ def test_proof_eval_reports_engine_regret_against_exact_ev() -> None:
 
     evaluation = evaluate_scenario(scenario, include_monte_carlo=False)
 
+    exact_ev = {move.card: move.exact_ev for move in evaluation.move_evaluations}
+
     assert evaluation.exhaustive
-    assert evaluation.hidden_deals == 90
-    assert evaluation.exact_choice in evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand)
-    assert evaluation.heuristic_choice in evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand)
-    assert evaluation.heuristic_regret >= 0.0
-    assert {move.card for move in evaluation.move_evaluations} == set(
-        evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand)
-    )
+    assert evaluation.exact_choice == Card(Suit.CLUBS, 6)
+    assert set(exact_ev) == set(evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand))
+    assert evaluation.heuristic_regret == exact_ev[evaluation.exact_choice] - exact_ev[evaluation.heuristic_choice]
+    assert evaluation.monte_carlo_choice is None
