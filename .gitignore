@@ -1,0 +1,13 @@
+# Docs are kept locally, not in the repo
+*.md
+
+# Generated reports and cluster artifacts
+full_game_reports/
+proof_reports/
+tuning_reports/
+logs/
+*.sif
+
+__pycache__/
+*.pyc
+.venv/
