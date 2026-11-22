@@ -5,6 +5,7 @@
 full_game_reports/
 proof_reports/
 tuning_reports/
+experiments/results/
 logs/
 *.sif
 

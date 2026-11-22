@@ -1,3 +1,4 @@
+import itertools
 import math
 import random
 
@@ -5,6 +6,8 @@ from seven_hearts import (
     BoundedInformationLimitedPolicyCache,
     BoundedRolloutTranspositionCache,
     Card,
+    EXACT_LAYOUT_VOTE_POLICY,
+    FirstOutSolver,
     FullInformationState,
     GameState,
     FullGameAgent,
@@ -34,6 +37,7 @@ from seven_hearts import (
     format_exact_imperfect_information_certificate,
     format_exact_solver_certificate,
     future_chain_impact,
+    first_empty_player,
     first_empty_player_mask,
     full_deck,
     hand_count_tuple,
@@ -46,6 +50,7 @@ from seven_hearts import (
     mask_to_cards,
     recommend_move,
     recommend_move_exact_imperfect_information,
+    recommend_move_exact_layout_vote,
     recommend_move_exact_information_limited_policy,
     recommend_move_information_limited_monte_carlo,
     recommend_move_monte_carlo,
@@ -62,8 +67,10 @@ from seven_hearts import (
     solve_full_information_against_policy,
     simulate_full_game_to_completion,
     summarize_duplicate_deal_results,
+    table_suit_codes,
     time_to_playable,
 )
+from best_response import BestResponseSolver, evaluate_assumed_table, hero_policy, opponent_policy
 from proof_benchmark import hard_benchmark_positions
 from proof_eval import evaluate_scenario, evaluation_scenarios
 
@@ -1624,6 +1631,96 @@ def test_full_information_memoized_solver_matches_random_tiny_brute_force() -> N
         assert result.deadlock_states == 0
 
 
+def random_reduced_decision_points(rng: random.Random, cards_per_suit: int, deals: int):
+    """Yield (state, hands) at every multi-legal decision of random-play reduced games, before first-out."""
+    for _ in range(deals):
+        hands = deal_random_hands(rng, cards_per_suit=cards_per_suit)
+        state = initial_state_for_hands(hands)
+        while first_empty_player(hands) is None:
+            legal = state.legal_moves(hands[state.current_player])
+            if len(legal) >= 2:
+                yield state, {player: set(cards) for player, cards in hands.items()}
+            card = rng.choice(legal) if legal else None
+            state, hands = apply_known_play(state, hands, state.current_player, card)
+
+
+def test_first_out_solver_matches_exact_solver_on_reduced_games() -> None:
+    rng = random.Random(21)
+    checked = 0
+    for cards_per_suit, deals in ((3, 40), (4, 40), (5, 12)):
+        for state, hands in random_reduced_decision_points(rng, cards_per_suit, deals):
+            player = state.current_player
+            exact = solve_full_information(FullInformationState.from_hands(hands, state))
+            legal = state.legal_moves(hands[player])
+            solver = FirstOutSolver(hands)
+
+            assert solver.move_wins(state.table, player, legal) == [
+                exact.move_values[card][player] == 1.0 for card in legal
+            ]
+            assert solver.winner(table_suit_codes(state.table), player) == exact.value.index(1.0)
+            checked += 1
+    assert checked > 200
+
+
+def test_first_out_solver_finishes_a_full_deck_deal() -> None:
+    hands = deal_random_hands(random.Random(0))
+    state = initial_state_for_hands(hands)
+    solver = FirstOutSolver(hands)
+
+    winner = solver.winner(table_suit_codes(state.table), state.current_player)
+
+    assert winner in range(4)
+    assert solver.states_evaluated < len(solver.memo)
+
+
+def test_exact_layout_vote_picks_the_move_that_wins_most_layouts() -> None:
+    rng = random.Random(22)
+    found = 0
+    for state, hands in random_reduced_decision_points(rng, 4, 60):
+        player = state.current_player
+        knowledge = PlayerKnowledge(player, frozenset(hands[player]), deck=frozenset(reduced_deck(4)))
+        enumeration = enumerate_hidden_deals(state, knowledge, max_deals=65)
+        if not enumeration.exhaustive:
+            continue
+        legal = state.legal_moves(hands[player])
+        wins = {card: 0 for card in legal}
+        for deal in enumeration.deals:
+            layout = {p: set(deal.hand(p)) for p in range(4)} | {player: set(hands[player])}
+            exact = solve_full_information(FullInformationState.from_hands(layout, state))
+            for card in legal:
+                wins[card] += exact.move_values[card][player] == 1.0
+        most = max(wins.values())
+        leaders = [card for card in legal if wins[card] == most]
+        if len(leaders) != 1:
+            continue
+
+        vote = recommend_move_exact_layout_vote(state, knowledge, layouts=64, rng=random.Random(0))
+
+        assert vote is not None and vote.exhaustive
+        assert vote.card == leaders[0]
+        assert vote.win_rate == most / len(enumeration.deals)
+        found += 1
+    assert found >= 10
+
+
+def test_exact_vote_agent_plays_full_reduced_games() -> None:
+    agents = (
+        FullGameAgent("Exact Vote", EXACT_LAYOUT_VOTE_POLICY, samples_per_move=8),
+        FullGameAgent("Random", "random"),
+        FullGameAgent("Greedy", "greedy_furthest_from_seven"),
+        FullGameAgent("Heuristic", "heuristic"),
+    )
+    rng = random.Random(23)
+    for _ in range(3):
+        hands = deal_random_hands(rng, cards_per_suit=5)
+        result = simulate_full_game_to_completion(
+            hands, agents, rng=rng, max_turns=200, deck=frozenset(reduced_deck(5))
+        )
+
+        assert not result.timed_out
+        assert sorted(result.finish_order) == [0, 1, 2, 3]
+
+
 def test_random_full_game_walk_preserves_conservation_and_table_invariants() -> None:
     rng = random.Random(13)
 
@@ -2086,3 +2183,201 @@ def test_proof_eval_reports_engine_regret_against_exact_ev() -> None:
     assert set(exact_ev) == set(evaluation.scenario.state.legal_moves(evaluation.scenario.knowledge.hand))
     assert evaluation.heuristic_regret == exact_ev[evaluation.exact_choice] - exact_ev[evaluation.heuristic_choice]
     assert evaluation.monte_carlo_choice is None
+
+
+def direct_layout_value(state, hands, hero, opponents, hero_choice) -> float:
+    """First-out win probability for one fully known layout, by plain recursion over every action.
+
+    hero_choice(state, hand_mask) gives the hero's distribution, or None to take the best move
+    knowing the layout (a clairvoyant hero).
+    """
+    player = state.current_player
+    legal = state.legal_moves(hands[player])
+    if not legal:
+        next_state, next_hands = apply_known_play(state, hands, player, None)
+        return direct_layout_value(next_state, next_hands, hero, opponents, hero_choice)
+    hand_mask = card_set_mask(hands[player])
+    if player == hero:
+        options = hero_choice(state, hand_mask)
+        if options is None:
+            options = [(card, None) for card in legal]
+    else:
+        options = opponents[player](state, player, hand_mask)
+
+    def after(card) -> float:
+        next_state, next_hands = apply_known_play(state, hands, player, card)
+        if not next_hands[player]:
+            return 1.0 if player == hero else 0.0
+        return direct_layout_value(next_state, next_hands, hero, opponents, hero_choice)
+
+    if player == hero and options[0][1] is None:
+        return max(after(card) for card, _ in options)
+    return sum(probability * after(card) for card, probability in options)
+
+
+def all_layouts_for_hero(hero_hand, hero, deck):
+    """Every deal of the unseen cards to the other seats, equal hand sizes, by brute force."""
+    unseen = sorted(set(deck) - set(hero_hand), key=card_index)
+    seats = [seat for seat in range(4) if seat != hero]
+    size = len(hero_hand)
+    for assignment in itertools.product(seats, repeat=len(unseen)):
+        if all(assignment.count(seat) == size for seat in seats):
+            hands = {seat: {card for card, owner in zip(unseen, assignment) if owner == seat} for seat in seats}
+            hands[hero] = set(hero_hand)
+            yield hands
+
+
+def direct_policy_value(hero_hand, hero, deck, opponents, hero_choice) -> float:
+    values = [
+        direct_layout_value(initial_state_for_hands(hands), hands, hero, opponents, hero_choice)
+        for hands in all_layouts_for_hero(hero_hand, hero, deck)
+    ]
+    return sum(values) / len(values)
+
+
+def best_response_cases(cards_per_suit: int, count: int, seed: int):
+    rng = random.Random(seed)
+    deck = frozenset(reduced_deck(cards_per_suit))
+    for index in range(count):
+        hero = index % 4
+        hero_hand = frozenset(deal_random_hands(rng, cards_per_suit=cards_per_suit)[hero])
+        names = ["random", "greedy", "heuristic"]
+        rng.shuffle(names)
+        seats = [seat for seat in range(4) if seat != hero]
+        opponents = {seat: opponent_policy(name, deck) for seat, name in zip(seats, names)}
+        yield deck, hero, hero_hand, opponents
+
+
+def test_best_response_policy_values_match_direct_recursion() -> None:
+    checked = 0
+    for cards_per_suit, count in ((2, 8), (3, 1)):
+        for deck, hero, hero_hand, opponents in best_response_cases(cards_per_suit, count, seed=31):
+            solver = BestResponseSolver(hero_hand, opponents, hero=hero, deck=deck)
+            assert solver.layouts == sum(1 for _ in all_layouts_for_hero(hero_hand, hero, deck))
+            for name in ("random", "greedy", "heuristic"):
+                policy = hero_policy(name, deck)
+                direct = direct_policy_value(
+                    hero_hand, hero, deck, opponents,
+                    lambda state, hand_mask: policy(state, hero, hand_mask, {}),
+                )
+                assert abs(solver.value(policy) - direct) < 1e-9
+                checked += 1
+    assert checked == 27
+
+
+def test_best_response_is_achievable_without_hidden_cards_and_bounded() -> None:
+    information_costs = 0
+    beats_heuristic = 0
+    # Seed 40 gives a 3-card hand where the heuristic is (slightly) suboptimal.
+    for cards_per_suit, count, seed in ((2, 16, 32), (3, 1, 40)):
+        for deck, hero, hero_hand, opponents in best_response_cases(cards_per_suit, count, seed):
+            solver = BestResponseSolver(hero_hand, opponents, hero=hero, deck=deck)
+            best = solver.value()
+            # The best-response policy only reads the public history, and achieves its value.
+            policy = solver.best_response_policy()
+            achieved = direct_policy_value(
+                hero_hand, hero, deck, opponents, lambda state, hand_mask: policy(state, hero, hand_mask, {})
+            )
+            assert abs(achieved - best) < 1e-9
+            clairvoyant = direct_policy_value(hero_hand, hero, deck, opponents, lambda state, hand_mask: None)
+            assert best <= clairvoyant + 1e-9
+            information_costs += best < clairvoyant - 1e-9
+            for name in ("random", "greedy", "heuristic", "exact_vote", "posterior_vote"):
+                value = solver.value(hero_policy(name, deck))
+                assert value <= best + 1e-9
+                if name == "heuristic":
+                    beats_heuristic += value < best - 1e-9
+    assert information_costs >= 1
+    assert beats_heuristic >= 1
+
+
+def test_assumed_table_best_response_matches_direct_recursion_and_bounds() -> None:
+    checked = 0
+    for cards_per_suit, count, seed in ((2, 8, 33), (3, 1, 40)):
+        for deck, hero, hero_hand, opponents in best_response_cases(cards_per_suit, count, seed):
+            # Random opponents give every legal action positive probability, so the best
+            # response to them is defined at every history any table can produce.
+            all_random = {seat: opponent_policy("random", deck) for seat in opponents}
+            assumed = BestResponseSolver(hero_hand, all_random, hero=hero, deck=deck)
+            assumed.value()
+            actual = BestResponseSolver(hero_hand, opponents, hero=hero, deck=deck)
+            best = actual.value()
+
+            result = evaluate_assumed_table(assumed, actual)
+            moves = assumed.best_moves
+            direct = direct_policy_value(
+                hero_hand, hero, deck, opponents, lambda state, hand_mask: ((moves[state.history], 1.0),)
+            )
+            assert abs(result.value - direct) < 1e-9
+            assert result.value <= best + 1e-9
+            assert result.agree_mass <= result.decision_mass + 1e-9
+
+            same = evaluate_assumed_table(actual, actual)
+            assert abs(same.value - best) < 1e-9
+            assert abs(same.agree_mass - same.decision_mass) < 1e-9
+            checked += 1
+    assert checked == 9
+
+
+def test_best_response_from_position_matches_the_full_game_solver() -> None:
+    """Starting mid-game gives the same posterior and values as walking the full solver there."""
+    checked = 0
+    for cards_per_suit, count, seed in ((2, 6, 35), (3, 2, 36)):
+        rng = random.Random(seed)
+        for deck, hero, hero_hand, opponents in best_response_cases(cards_per_suit, count, seed):
+            full = BestResponseSolver(hero_hand, opponents, hero=hero, deck=deck)
+            heuristic = hero_policy("heuristic", deck)
+            hands = {seat: set(cards) for seat, cards in enumerate(deal_consistent_hands(rng, hero, hero_hand, deck))}
+            starter = next(seat for seat in range(4) if Card(Suit.HEARTS, 7) in hands[seat])
+            state, belief = next((s, b) for s, b in full.roots if s.current_player == starter)
+            while all(hands.values()):
+                player = state.current_player
+                mask = card_set_mask(hands[player])
+                if player == hero and state.history:
+                    position = BestResponseSolver.from_position(state, hero, hands[hero], opponents, deck)
+                    (_, posterior), = position.roots
+                    mass, total = sum(belief.values()), sum(posterior.values())
+                    support = {layout for layout, weight in belief.items() if weight > 0.0}
+                    assert set(posterior) == support
+                    assert all(abs(posterior[l] / total - belief[l] / mass) < 1e-12 for l in support)
+                    assert abs(position.value() - full._node(state, belief, None) / mass) < 1e-9
+                    assert abs(position.value(heuristic) - full._node(state, belief, heuristic) / mass) < 1e-9
+                    checked += 1
+                if player == hero:
+                    choices = heuristic(state, player, mask, belief)
+                else:
+                    choices = opponents[player](state, player, mask)
+                cards, weights = zip(*choices)
+                card = rng.choices(cards, weights)[0]
+                if player != hero:
+                    belief = next(child for child_state, child in full._opponent_children(state, belief)
+                                  if child_state.history[-1].card == card) if hands[player] != {card} else belief
+                if card is not None:
+                    hands[player].discard(card)
+                state = state.after_play(player, card)
+    assert checked >= 6
+
+
+def deal_consistent_hands(rng, hero, hero_hand, deck):
+    rest = sorted(deck - hero_hand, key=card_index)
+    rng.shuffle(rest)
+    size = len(hero_hand)
+    others = [rest[i * size:(i + 1) * size] for i in range(3)]
+    return [hero_hand if seat == hero else others.pop(0) for seat in range(4)]
+
+
+def test_policy_decision_losses_add_up_to_regret() -> None:
+    nonzero = 0
+    # Seed 40 gives a 3-card hand where the heuristic is (slightly) suboptimal.
+    for cards_per_suit, count, seed in ((2, 6, 34), (3, 1, 40)):
+        for deck, hero, hero_hand, opponents in best_response_cases(cards_per_suit, count, seed):
+            solver = BestResponseSolver(hero_hand, opponents, hero=hero, deck=deck)
+            best = solver.value()
+            for name in ("heuristic", "random"):
+                policy = hero_policy(name, deck)
+                records = solver.policy_decisions(policy)
+                regret = best - solver.value(policy)
+                assert abs(sum(record.reach * record.loss() for record in records) - regret) < 1e-9
+                assert all(len(record.legal) > 1 and record.loss() >= -1e-12 for record in records)
+                nonzero += regret > 1e-9
+    assert nonzero >= 2

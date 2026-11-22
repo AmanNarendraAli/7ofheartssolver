@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -615,6 +615,145 @@ def choose_rational_move(
         if len(tied) == 1:
             return next(iter(tied))
     return sorted(tied)[0]
+
+
+SUIT_STATES = ((None, None),) + tuple((low, high) for low in range(1, 8) for high in range(7, 14))
+OPENED_SUIT_STATE = 1 + 6 * 7  # (7, 7)
+COMPACT_MEMO_MAX_CARDS = 24
+
+
+def suit_state_code(low: int | None, high: int | None) -> int:
+    """Index into SUIT_STATES: 0 for an unopened suit, else 1 + 7 * (low - 1) + (high - 7)."""
+    return 0 if low is None or high is None else 1 + (low - 1) * 7 + (high - 7)
+
+
+def table_suit_codes(table: Mapping[Suit, SuitRun]) -> tuple[int, int, int, int]:
+    return tuple(suit_state_code(table[suit].low, table[suit].high) for suit in SUIT_ORDER)  # type: ignore[return-value]
+
+
+class FirstOutSolver:
+    """Exact first-out winner under full-information rational play, for one fixed layout.
+
+    Once the remaining hands are fixed, the table determines who still holds what,
+    so a position is just (suit states, player to move): at most 50**4 * 4 of them,
+    stored one byte each. Rational play here equals `solve_full_information` with
+    `choose_rational_move`: values are one-hot, so a player wins if any move wins,
+    otherwise takes the lowest card whose winner is not the next player, otherwise
+    the lowest card.
+    """
+
+    def __init__(self, hands: Mapping[int, Iterable[Card]]) -> None:
+        owner = [[-1] * 15 for _ in range(4)]
+        counts = [0, 0, 0, 0]
+        for player, hand in hands.items():
+            for card in hand:
+                owner[SUIT_INDEX[card.suit]][card.rank] = player
+                counts[player] += 1
+        self.owner = owner
+        self.counts = tuple(counts)
+        # moves[suit][code] = ((holder, next_code), ...) in card order, low side first
+        self.moves = tuple(
+            tuple(self._suit_moves(owner[suit], low, high) for low, high in SUIT_STATES)
+            for suit in range(4)
+        )
+        # played[suit][code][player] = how many of player's current cards that suit state has used
+        self.played = tuple(
+            tuple(
+                tuple(
+                    0 if low is None else sum(1 for rank in range(low, high + 1) if owner[suit][rank] == player)
+                    for player in range(4)
+                )
+                for low, high in SUIT_STATES
+            )
+            for suit in range(4)
+        )
+        # 0 = unsolved, else winner + 1. Allocating the full table costs more than a whole
+        # small solve, so positions with few cards left use a dict that reads 0 when unset.
+        if sum(counts) > COMPACT_MEMO_MAX_CARDS:
+            self.memo = bytearray(len(SUIT_STATES) ** 4 * 4)
+        else:
+            self.memo = defaultdict(int)
+        self.states_evaluated = 0
+
+    @staticmethod
+    def _suit_moves(holders: list[int], low: int | None, high: int | None) -> tuple[tuple[int, int], ...]:
+        if low is None or high is None:
+            return ((holders[7], OPENED_SUIT_STATE),) if holders[7] >= 0 else ()
+        moves = []
+        if low > 1 and holders[low - 1] >= 0:
+            moves.append((holders[low - 1], suit_state_code(low - 1, high)))
+        if high < 13 and holders[high + 1] >= 0:
+            moves.append((holders[high + 1], suit_state_code(low, high + 1)))
+        return tuple(moves)
+
+    def cards_left(self, codes: Sequence[int], player: int) -> int:
+        played = self.played
+        return (
+            self.counts[player]
+            - played[0][codes[0]][player]
+            - played[1][codes[1]][player]
+            - played[2][codes[2]][player]
+            - played[3][codes[3]][player]
+        )
+
+    def legal(self, codes: Sequence[int], player: int) -> list[tuple[int, int]]:
+        """(suit, next_code) for each legal card of `player`, in card order."""
+        if not any(codes):
+            hearts = SUIT_INDEX[Suit.HEARTS]
+            return [(hearts, OPENED_SUIT_STATE)] if self.owner[hearts][7] == player else []
+        return [
+            (suit, next_code)
+            for suit in range(4)
+            for holder, next_code in self.moves[suit][codes[suit]]
+            if holder == player
+        ]
+
+    def winner(self, codes: Sequence[int], player: int) -> int:
+        """First-out winner from this position with `player` to act."""
+        for _ in range(4):
+            legal = self.legal(codes, player)
+            if legal:
+                break
+            player = (player + 1) % 4
+        else:
+            raise ValueError("deadlock: nobody can play")
+
+        key = (((codes[0] * 50 + codes[1]) * 50 + codes[2]) * 50 + codes[3]) * 4 + player
+        cached = self.memo[key]
+        if cached:
+            return cached - 1
+
+        self.states_evaluated += 1
+        next_player = (player + 1) % 4
+        result = None
+        fallback = None
+        for suit, next_code in legal:
+            child = list(codes)
+            child[suit] = next_code
+            if self.cards_left(child, player) == 0:
+                result = player
+                break
+            child_winner = self.winner(child, next_player)
+            if child_winner == player:
+                result = player
+                break
+            if fallback is None and child_winner != next_player:
+                fallback = child_winner
+        if result is None:
+            result = fallback if fallback is not None else next_player
+        self.memo[key] = result + 1
+        return result
+
+    def move_wins(self, table: Mapping[Suit, SuitRun], player: int, cards: Sequence[Card]) -> list[bool]:
+        """For each card `player` could play now, whether they go out first under exact play."""
+        codes = table_suit_codes(table)
+        out = []
+        for card in cards:
+            run = table[card.suit].play(card.rank)
+            child = list(codes)
+            child[SUIT_INDEX[card.suit]] = suit_state_code(run.low, run.high)
+            out.append(self.cards_left(child, player) == 0 or self.winner(child, (player + 1) % 4) == player)
+        return out
 
 
 def format_value(value: tuple[float, float, float, float]) -> str:
@@ -2073,6 +2212,61 @@ def evaluate_move_information_limited_monte_carlo_from_deals(
     return rollout_move_score(card, knowledge.player, results, weights, policy_name, exhaustive)
 
 
+EXACT_LAYOUT_VOTE_POLICY = "exact_layout_vote"
+
+
+def recommend_move_exact_layout_vote(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    layouts: int = 64,
+    rng: random.Random | None = None,
+    weights: StrategyWeights = DEFAULT_WEIGHTS,
+) -> MonteCarloMoveScore | None:
+    """Play the move that goes out first in the most hidden layouts, each solved exactly.
+
+    Layouts are drawn uniformly from those consistent with the player's information
+    (exhaustively when there are at most `layouts`). After the move every layout is
+    solved with full-information rational play, so this is determinized search with
+    an exact continuation. Ties go to the heuristic's preferred move.
+    """
+    legal = state.legal_moves(knowledge.hand)
+    if not legal:
+        return None
+    immediate_win = immediate_winning_move(knowledge, legal)
+    if immediate_win is not None:
+        return terminal_win_monte_carlo_score(
+            state, knowledge, immediate_win, weights, f"{EXACT_LAYOUT_VOTE_POLICY}_immediate_win"
+        )
+    if len(legal) == 1:
+        return forced_move_monte_carlo_score(legal[0], f"{EXACT_LAYOUT_VOTE_POLICY}_forced_move")
+
+    rng = rng or random.Random()
+    selection = choose_hidden_deals_for_budget(state, knowledge, layouts, rng)
+    wins = [0] * len(legal)
+    for hidden_deal in selection.deals:
+        layout_wins = FirstOutSolver(complete_hands(knowledge, hidden_deal)).move_wins(
+            state.table, knowledge.player, legal
+        )
+        for index, won in enumerate(layout_wins):
+            wins[index] += won
+
+    model = build_opponent_model(state, knowledge)
+    heuristic = [score_move(state, knowledge, card, model=model, weights=weights).score for card in legal]
+    best = max(range(len(legal)), key=lambda index: (wins[index], heuristic[index]))
+    samples = len(selection.deals)
+    win_rate = wins[best] / samples if samples else 0.0
+    return MonteCarloMoveScore(
+        card=legal[best],
+        score=win_rate * weights.monte_carlo_win_rate_weight,
+        win_rate=win_rate,
+        average_finish_margin=0.0,
+        samples=samples,
+        win_rate_standard_error=sqrt(win_rate * (1.0 - win_rate) / samples) if samples else 0.0,
+        policy_name=EXACT_LAYOUT_VOTE_POLICY,
+        exhaustive=selection.exhaustive,
+    )
+
+
 def recommend_move_perfect_information_rollout_ev(
     state: GameState,
     hands: Mapping[int, set[Card]],
@@ -2853,6 +3047,11 @@ def choose_full_game_agent_move(
             legal,
             key=lambda card: score_move(state, knowledge, card, model=model, weights=agent.weights).score,
         )
+    if agent.policy in SEVEN_RULE_POLICIES:
+        knowledge = PlayerKnowledge(player, frozenset(hands[player]), deck=deck)
+        return recommend_move_seven_rule(
+            state, knowledge, agent.weights, hold_neighbour_sevens=SEVEN_RULE_POLICIES[agent.policy]
+        )
     if agent.policy == "information_limited_monte_carlo":
         knowledge = PlayerKnowledge(player, frozenset(hands[player]), deck=deck)
         recommendation = recommend_move_information_limited_monte_carlo(
@@ -2881,6 +3080,12 @@ def choose_full_game_agent_move(
             rationality=agent.rationality,
             policy_cache=policy_cache,
             rollout_cache=rollout_cache,
+        )
+        return recommendation.card if recommendation is not None else None
+    if agent.policy == EXACT_LAYOUT_VOTE_POLICY:
+        knowledge = PlayerKnowledge(player, frozenset(hands[player]), deck=deck)
+        recommendation = recommend_move_exact_layout_vote(
+            state, knowledge, layouts=agent.samples_per_move, rng=rng, weights=agent.weights
         )
         return recommendation.card if recommendation is not None else None
     if agent.policy == "oracle_greedy":
@@ -3001,7 +3206,11 @@ def simulate_full_game_to_completion(
         agent = agents_by_seat[player]
         legal = state.legal_moves(current_hands[player])
         immediate_win = bool(legal and len(current_hands[player]) == 1)
-        sampled_mc = agent.policy == "information_limited_monte_carlo" and len(legal) > 1 and not immediate_win
+        sampled_mc = (
+            agent.policy in ("information_limited_monte_carlo", EXACT_LAYOUT_VOTE_POLICY)
+            and len(legal) > 1
+            and not immediate_win
+        )
         counts = decision_counts[player]
         decision_counts[player] = FullGameDecisionCounts(
             turns=counts.turns + 1,
@@ -3641,6 +3850,57 @@ def recommend_move(
         return None
     model = build_opponent_model(state, knowledge)
     return max((score_move(state, knowledge, card, model, weights) for card in legal), key=lambda s: s.score)
+
+
+SEVEN_GAP_POLICY = "heuristic_seven_gap"
+SEVEN_RULE_POLICY = "heuristic_seven_rule"
+SEVEN_PAIR_RULE_POLICY = "heuristic_seven_pair_rule"
+SEVEN_RULE_POLICIES = {SEVEN_GAP_POLICY: None, SEVEN_RULE_POLICY: "any", SEVEN_PAIR_RULE_POLICY: "pair"}
+
+
+def seven_kind(card: Card, hand: Iterable[Card]) -> str | None:
+    """For a 7: 'gap' if you hold another card of its suit but not its neighbours, 'neighbour' if
+    you hold a 6 or 8 of it, 'lone' otherwise. None for other cards."""
+    if card.rank != 7:
+        return None
+    same = [other.rank for other in hand if other.suit == card.suit and other.rank != 7]
+    if not same:
+        return "lone"
+    return "neighbour" if any(abs(rank - 7) == 1 for rank in same) else "gap"
+
+
+def recommend_move_seven_rule(
+    state: GameState,
+    knowledge: PlayerKnowledge,
+    weights: StrategyWeights = DEFAULT_WEIGHTS,
+    hold_neighbour_sevens: str | None = "any",
+) -> Card | None:
+    """The heuristic with one rule about sevens, found by comparing it with exact best responses.
+
+    Open a 7 when you hold a card of that suit beyond a gap (others must fill the gap before
+    you can play it). hold_neighbour_sevens: None never holds; "any" avoids opening a 7 whose
+    neighbour you hold while another card is playable; "pair" does so only when that neighbour
+    is your only other card of the suit and the alternative is not a 7. Ties go to the
+    heuristic score.
+    """
+    legal = state.legal_moves(knowledge.hand)
+    if not legal:
+        return None
+    model = build_opponent_model(state, knowledge)
+    scores = {card: score_move(state, knowledge, card, model, weights).score for card in legal}
+    kinds = {card: seven_kind(card, knowledge.hand) for card in legal}
+    candidates = [card for card in legal if kinds[card] == "gap"] or legal
+    if hold_neighbour_sevens == "any":
+        candidates = [card for card in candidates if kinds[card] != "neighbour"] or candidates
+    elif hold_neighbour_sevens == "pair":
+        def held_pair(card: Card) -> bool:
+            return kinds[card] == "neighbour" and sum(1 for other in knowledge.hand if other.suit == card.suit) == 2
+        non_sevens = [card for card in candidates if kinds[card] is None]
+        if non_sevens:
+            candidates = [card for card in candidates if not held_pair(card)] or candidates
+    elif hold_neighbour_sevens is not None:
+        raise ValueError(f"unknown hold_neighbour_sevens: {hold_neighbour_sevens}")
+    return max(candidates, key=lambda card: scores[card])
 
 
 def parse_cards(text: str) -> frozenset[Card]:

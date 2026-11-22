@@ -16,6 +16,10 @@ from seven_hearts import (
     DECISION_COUNT_FIELDS,
     DEFAULT_CACHE_MAX_ENTRIES,
     DEFAULT_MONTE_CARLO_AGENT_NAME,
+    EXACT_LAYOUT_VOTE_POLICY,
+    SEVEN_GAP_POLICY,
+    SEVEN_PAIR_RULE_POLICY,
+    SEVEN_RULE_POLICIES,
     DecisionTrace,
     DuplicateDealEvaluation,
     FullGameAgent,
@@ -27,22 +31,32 @@ from seven_hearts import (
 REPORT_DIR = Path("full_game_reports")
 
 
+EXACT_VOTE_AGENT_NAME = "Exact Vote"
+SEVEN_RULE_AGENT_NAME = "Seven Rule"
+
+
 def default_agents(
     samples_per_move: int,
     rollout_max_turns: int,
     fast: bool = False,
     oracle_gap: bool = False,
+    exact_vote: bool = False,
+    seven_rule: str | None = None,
 ) -> tuple[FullGameAgent, ...]:
-    monte_carlo = (
-        FullGameAgent(DEFAULT_MONTE_CARLO_AGENT_NAME, "heuristic")
-        if fast
-        else FullGameAgent(
+    if seven_rule:
+        policy = {"pair": SEVEN_PAIR_RULE_POLICY, "gap": SEVEN_GAP_POLICY}[seven_rule]
+        monte_carlo = FullGameAgent(SEVEN_RULE_AGENT_NAME, policy)
+    elif exact_vote:
+        monte_carlo = FullGameAgent(EXACT_VOTE_AGENT_NAME, EXACT_LAYOUT_VOTE_POLICY, samples_per_move=samples_per_move)
+    elif fast:
+        monte_carlo = FullGameAgent(DEFAULT_MONTE_CARLO_AGENT_NAME, "heuristic")
+    else:
+        monte_carlo = FullGameAgent(
             DEFAULT_MONTE_CARLO_AGENT_NAME,
             "information_limited_monte_carlo",
             samples_per_move=samples_per_move,
             rollout_max_turns=rollout_max_turns,
         )
-    )
     if oracle_gap:
         return (
             monte_carlo,
@@ -130,6 +144,8 @@ def agent_metadata(agent: FullGameAgent) -> dict[str, Any]:
         "information_limited_monte_carlo",
         "perfect_information_counterpart_oracle",
         "oracle_greedy",
+        EXACT_LAYOUT_VOTE_POLICY,
+        *SEVEN_RULE_POLICIES,
     }
     metadata: dict[str, Any] = {
         "name": agent.name,
@@ -138,6 +154,8 @@ def agent_metadata(agent: FullGameAgent) -> dict[str, Any]:
         "uses_rollout_ev": uses_rollout_ev,
         "uses_heuristic_weights": uses_heuristic_weights,
     }
+    if agent.policy == EXACT_LAYOUT_VOTE_POLICY:
+        metadata["exact_layout_vote"] = {"layouts_per_decision": agent.samples_per_move}
     if uses_rollout_ev:
         metadata["rollout_ev"] = {
             "samples_or_rollouts_per_move": agent.samples_per_move,
@@ -173,7 +191,7 @@ def heuristic_weight_metadata(weights: Any) -> dict[str, Any]:
 def active_agent_parameter_rows(agent: FullGameAgent) -> list[list[Any]]:
     metadata = agent_metadata(agent)
     rows: list[list[Any]] = [[agent.name, agent.policy, "policy", agent.policy]]
-    for section in ("rollout_ev", "heuristic_weights"):
+    for section in ("exact_layout_vote", "rollout_ev", "heuristic_weights"):
         if section in metadata:
             rows.extend(
                 [agent.name, agent.policy, name, value]
@@ -199,7 +217,11 @@ def build_global_parameter_metadata(args: argparse.Namespace, output_dir: Path, 
         "output_dir": str(output_dir),
         "eval_args": json_safe(vars(args)),
         "duplicate_deal": {
-            "primary_agent_name": DEFAULT_MONTE_CARLO_AGENT_NAME,
+            "primary_agent_name": (
+                SEVEN_RULE_AGENT_NAME if getattr(args, "seven_rule", False)
+                else EXACT_VOTE_AGENT_NAME if getattr(args, "exact_vote", False)
+                else DEFAULT_MONTE_CARLO_AGENT_NAME
+            ),
             "rotations_per_deal": 4,
         },
         "implementation_defaults": {
@@ -510,6 +532,19 @@ def main() -> None:
         help="replace Random with the perfect-information counterpart oracle for oracle-gap analysis",
     )
     parser.add_argument(
+        "--exact-vote",
+        action="store_true",
+        help="replace Monte Carlo with Exact Vote: --samples-per-move hidden layouts, each solved exactly",
+    )
+    parser.add_argument(
+        "--seven-rule",
+        nargs="?",
+        const="pair",
+        choices=("pair", "gap"),
+        help="replace Monte Carlo with the heuristic plus a sevens rule (no search): "
+        "pair (default) = open gap sevens, hold a seven paired with its only neighbour; gap = gap part only",
+    )
+    parser.add_argument(
         "--progress-every",
         type=int,
         default=1,
@@ -534,13 +569,15 @@ def main() -> None:
         args.rollout_max_turns,
         fast=args.fast,
         oracle_gap=args.oracle_gap,
+        exact_vote=args.exact_vote,
+        seven_rule=args.seven_rule,
     )
     evaluation = evaluate_duplicate_deal_seat_rotation(
         agents,
         deals=args.deals,
         rng=random.Random(args.seed),
         max_turns=args.max_turns,
-        primary_agent_name=DEFAULT_MONTE_CARLO_AGENT_NAME,
+        primary_agent_name=agents[0].name,
         progress_callback=make_progress_reporter(args.progress_every),
         cards_per_suit=args.cards_per_suit,
         workers=args.workers,
