@@ -20,6 +20,7 @@ import random
 import zlib
 from collections import defaultdict
 from itertools import combinations
+from math import comb
 from typing import Callable, Iterable, Mapping, NamedTuple
 
 from seven_hearts import (
@@ -32,6 +33,7 @@ from seven_hearts import (
     Suit,
     build_opponent_model,
     card_bit,
+    choose_hidden_deals_for_budget,
     card_set_mask,
     choose_full_game_agent_move,
     mask_to_cards,
@@ -105,6 +107,8 @@ def hero_policy(name: str, deck: Iterable[Card]) -> HeroPolicy:
         of the omniscient continuation alone; exact_vote's further gap to it is
         the cost of the uniform belief.
     mc: Monte Carlo over every consistent layout with heuristic rollouts.
+    reader:<agent>: assumes every opponent plays <agent> (e.g. reader:heuristic) and votes
+        over the hands that explain their moves; see ModelBelief.
     """
     deck = frozenset(deck)
     if name in ("random", *OPPONENT_AGENTS):
@@ -127,6 +131,8 @@ def hero_policy(name: str, deck: Iterable[Card]) -> HeroPolicy:
         return monte_carlo
     if name == "posterior_vote":
         return posterior_vote(deck)
+    if name.startswith("reader:"):
+        return model_reader(deck, name.split(":")[1])
     raise ValueError(f"unknown hero policy: {name}")
 
 
@@ -606,3 +612,201 @@ def position_posterior(
                 layout[third] = unseen_mask & ~first_mask & ~second_mask
                 belief[tuple(layout)] = first_weight * second_weight * third_weight  # type: ignore[index]
     return belief
+
+
+class ModelBelief:
+    """What a player believes about the opponents' hands if they assume all three play `model`.
+
+    `model` is a deterministic opponent policy. An opponent's possible hands are those
+    that explain every move they made under the model. If no hand does, the model is
+    wrong about that player, and from then on their hand is constrained only by the
+    cards: what has been played and what their forced passes rule out.
+
+    Built once from a position's full history, then advanced move by move.
+    """
+
+    def __init__(self, state: GameState, player: int, hand_mask: int, model: OpponentPolicy, deck: frozenset[Card]):
+        self.state = state
+        self.player = player
+        self.model = model
+        self.deck = deck
+        self.seats = [seat for seat in range(4) if seat != player]
+        states = replay_states(state, len(deck))
+        unseen = card_set_mask(deck) & ~hand_mask & ~state.played_cards_mask()
+        self.possible = {seat: unseen for seat in self.seats}  # cards each opponent can hold
+        for before, event in zip(states, state.history):
+            if event.card is None and event.player in self.possible:
+                self.possible[event.player] &= ~before.public_legal_mask()
+        # seat -> hands that explain the seat's moves, or None once the model is rejected for it
+        self.explained: dict[int, set[int] | None] = {}
+        for seat in self.seats:
+            hands = set()
+            for hand in combinations(mask_to_cards(self.possible[seat]), state.hand_counts[seat]):  # type: ignore[arg-type]
+                mask = card_set_mask(hand)
+                if history_likelihood(model, states, state.history, seat, mask) > 0.0:
+                    hands.add(mask)
+            self.explained[seat] = hands or None
+
+    def advanced(self, state: GameState) -> "ModelBelief":
+        """The belief at a later position whose history extends this one's."""
+        if state.history[: len(self.state.history)] != self.state.history:
+            raise ValueError("not a continuation of this position")
+        new = object.__new__(ModelBelief)
+        new.__dict__.update(self.__dict__)
+        new.possible = dict(self.possible)
+        new.explained = dict(self.explained)
+        current = self.state
+        for event in state.history[len(self.state.history):]:
+            mover = event.player
+            bit = 0 if event.card is None else card_bit(event.card)
+            for seat in new.seats:
+                hands = new.explained[seat]
+                if seat == mover:
+                    if event.card is None:
+                        new.possible[seat] &= ~current.public_legal_mask()
+                    else:
+                        new.possible[seat] &= ~bit
+                    if hands is not None:
+                        kept = {mask & ~bit for mask in hands
+                                if (event.card is None or mask & bit)
+                                and dict(new.model(current, seat, mask)).get(event.card, 0.0) > 0.0}
+                        new.explained[seat] = kept or None
+                elif bit:
+                    new.possible[seat] &= ~bit
+                    if hands is not None:
+                        kept = {mask for mask in hands if not mask & bit}
+                        new.explained[seat] = kept or None
+            current = current.after_play(mover, event.card)
+        new.state = state
+        return new
+
+    def layouts(self, hand_mask: int, limit: int, rng: random.Random) -> list[Layout]:
+        """Every layout the belief allows (uniformly weighted), or `limit` sampled ones if there are more."""
+        state = self.state
+        counts = {seat: state.hand_counts[seat] for seat in self.seats}  # type: ignore[index]
+        rejected = [seat for seat in self.seats if self.explained[seat] is None]
+        if len(rejected) < 3:
+            sampled = self._model_layouts(hand_mask, limit, rng, counts, rejected)
+            if sampled:
+                return sampled
+            # Otherwise the explained hands cannot all hold at once: fall back to the cards alone.
+        knowledge = PlayerKnowledge(self.player, frozenset(mask_to_cards(hand_mask)), deck=self.deck)
+        layouts = []
+        for deal in choose_hidden_deals_for_budget(state, knowledge, limit, rng).deals:
+            layout = [0, 0, 0, 0]
+            for seat in self.seats:
+                layout[seat] = card_set_mask(deal.hand(seat))
+            layouts.append(tuple(layout))
+        return layouts  # type: ignore[return-value]
+
+    def _model_layouts(
+        self, hand_mask: int, limit: int, rng: random.Random, counts: dict[int, int], rejected: list[int]
+    ) -> list[Layout]:
+        state = self.state
+        unseen = card_set_mask(self.deck) & ~hand_mask & ~state.played_cards_mask()
+        explained = sorted((seat for seat in self.seats if seat not in rejected),
+                           key=lambda seat: len(self.explained[seat]))  # type: ignore[arg-type]
+        # Partial assignments of the explained seats, each with its number of completions
+        # by the rejected seats (whose hands are any cards that fit).
+        partials: list[tuple[dict[int, int], int, int]] = []  # (hands, completions, remaining cards)
+
+        def completions(remaining: int) -> int:
+            if not rejected:
+                return 1 if remaining == 0 else 0
+            if len(rejected) == 1:
+                seat = rejected[0]
+                return 1 if remaining & ~self.possible[seat] == 0 else 0
+            a, b = rejected
+            forced_a = remaining & ~self.possible[b]
+            forced_b = remaining & ~self.possible[a]
+            if forced_a & forced_b:
+                return 0
+            free = (remaining & ~forced_a & ~forced_b).bit_count()
+            need = counts[a] - forced_a.bit_count()
+            return comb(free, need) if 0 <= need <= free else 0
+
+        def walk(index: int, remaining: int, hands: dict[int, int]) -> None:
+            if index == len(explained):
+                ways = completions(remaining)
+                if ways:
+                    partials.append((dict(hands), ways, remaining))
+                return
+            seat = explained[index]
+            for mask in self.explained[seat]:  # type: ignore[union-attr]
+                if mask & ~remaining == 0:
+                    hands[seat] = mask
+                    walk(index + 1, remaining & ~mask, hands)
+            hands.pop(seat, None)
+
+        walk(0, unseen, {})
+        total = sum(ways for _, ways, _ in partials)
+
+        def complete(hands: dict[int, int], remaining: int, pick: random.Random | None) -> list[Layout]:
+            base = [0, 0, 0, 0]
+            for seat, mask in hands.items():
+                base[seat] = mask
+            if not rejected:
+                return [tuple(base)]  # type: ignore[list-item]
+            if len(rejected) == 1:
+                base[rejected[0]] = remaining
+                return [tuple(base)]  # type: ignore[list-item]
+            a, b = rejected
+            forced_a = remaining & ~self.possible[b]
+            free_mask = remaining & ~forced_a & ~(remaining & ~self.possible[a])
+            free = mask_to_cards(free_mask)
+            need = counts[a] - forced_a.bit_count()
+            options = [pick.sample(free, need)] if pick is not None else combinations(free, need)
+            out = []
+            for chosen in options:
+                layout = list(base)
+                layout[a] = forced_a | card_set_mask(chosen)
+                layout[b] = remaining & ~layout[a]
+                out.append(tuple(layout))
+            return out  # type: ignore[return-value]
+
+        if total <= limit:
+            return [layout for hands, _, remaining in partials for layout in complete(hands, remaining, None)]
+        weights = [ways for _, ways, _ in partials]
+        return [complete(hands, remaining, rng)[0]
+                for hands, _, remaining in rng.choices(partials, weights, k=limit)]
+
+
+def model_reader(deck: frozenset[Card], model_name: str, max_layouts: int = 512) -> HeroPolicy:
+    """Vote over the layouts a ModelBelief allows, assuming every opponent plays `model_name`.
+
+    Uses only the hero's own information: the assumed model, never the real table's
+    policies. Beliefs are cached by history so each one is advanced from the nearest
+    earlier decision rather than rebuilt. Ties go to the heuristic's preferred move.
+    """
+    model = opponent_policy(model_name, deck)
+    cache: dict[tuple, ModelBelief] = {}
+
+    def vote(state: GameState, player: int, hand_mask: int, belief: Belief) -> Distribution:
+        legal = list(mask_to_cards(hand_mask & state.public_legal_mask()))
+        if len(legal) == 1:
+            return ((legal[0], 1.0),)
+        history = state.history
+        known = None
+        for length in range(len(history), -1, -1):
+            known = cache.get((player, history[:length]))
+            if known is not None:
+                break
+        current = known.advanced(state) if known is not None else ModelBelief(state, player, hand_mask, model, deck)
+        if len(cache) >= 20_000:
+            cache.clear()
+        cache[(player, history)] = current
+        key = ",".join(f"{event.player}{event.card}" for event in history) + f"|{hand_mask}"
+        layouts = current.layouts(hand_mask, max_layouts, random.Random(zlib.crc32(key.encode())))
+        hero_cards = mask_to_cards(hand_mask)
+        wins = [0] * len(legal)
+        for layout in layouts:
+            hands = {seat: mask_to_cards(mask) for seat, mask in enumerate(layout)}
+            hands[player] = hero_cards
+            for index, won in enumerate(FirstOutSolver(hands).move_wins(state.table, player, legal)):
+                wins[index] += won
+        knowledge = PlayerKnowledge(player, frozenset(hero_cards), deck=deck)
+        model_scores = build_opponent_model(state, knowledge)
+        heuristic = [score_move(state, knowledge, card, model=model_scores, weights=DEFAULT_WEIGHTS).score for card in legal]
+        best = max(range(len(legal)), key=lambda index: (wins[index], heuristic[index]))
+        return ((legal[best], 1.0),)
+    return vote

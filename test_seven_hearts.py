@@ -70,7 +70,7 @@ from seven_hearts import (
     table_suit_codes,
     time_to_playable,
 )
-from best_response import BestResponseSolver, evaluate_assumed_table, hero_policy, opponent_policy
+from best_response import BestResponseSolver, evaluate_assumed_table, hero_policy, opponent_policy, position_posterior
 from proof_benchmark import hard_benchmark_positions
 from proof_eval import evaluate_scenario, evaluation_scenarios
 
@@ -2356,6 +2356,49 @@ def test_best_response_from_position_matches_the_full_game_solver() -> None:
                     hands[player].discard(card)
                 state = state.after_play(player, card)
     assert checked >= 6
+
+
+def test_model_belief_matches_exact_posterior_and_advances_consistently() -> None:
+    """Against a table that really plays the model, the belief is the exact posterior's support."""
+    from best_response import ModelBelief
+    checked = rejected_seen = 0
+    for cards_per_suit, count, seed, names in ((3, 3, 41, ("heuristic",) * 3), (3, 3, 42, ("random", "greedy", "heuristic"))):
+        rng = random.Random(seed)
+        for deck, hero, hero_hand, _ in best_response_cases(cards_per_suit, count, seed):
+            seats = [seat for seat in range(4) if seat != hero]
+            opponents = {seat: opponent_policy(name, deck) for seat, name in zip(seats, names)}
+            model = opponent_policy("heuristic", deck)
+            hands = {seat: set(cards) for seat, cards in enumerate(deal_consistent_hands(rng, hero, hero_hand, deck))}
+            starter = next(seat for seat in range(4) if Card(Suit.HEARTS, 7) in hands[seat])
+            state = GameState(hand_counts=(cards_per_suit,) * 4, current_player=starter)
+            belief = None
+            while all(hands.values()):
+                player = state.current_player
+                mask = card_set_mask(hands[player])
+                if player == hero and state.history:
+                    fresh = ModelBelief(state, hero, mask, model, deck)
+                    belief = fresh if belief is None else belief.advanced(state)
+                    assert belief.explained == fresh.explained and belief.possible == fresh.possible
+                    layouts = belief.layouts(mask, 10**6, random.Random(0))
+                    assert len(set(layouts)) == len(layouts)
+                    for layout in layouts:
+                        assert sum(layout) == card_set_mask(deck) & ~mask & ~state.played_cards_mask()
+                        assert all(layout[seat].bit_count() == state.hand_counts[seat] for seat in seats)
+                        assert all(layout[seat] & ~belief.possible[seat] == 0 for seat in seats)
+                    true_layout = tuple(card_set_mask(hands[seat]) if seat != hero else 0 for seat in range(4))
+                    if names == ("heuristic",) * 3:
+                        assert set(layouts) == set(position_posterior(state, hero, mask, opponents, deck))
+                        assert true_layout in layouts
+                    rejected_seen += any(belief.explained[seat] is None for seat in seats)
+                    checked += 1
+                choices = opponents[player](state, player, mask) if player != hero else \
+                    hero_policy("heuristic", deck)(state, player, mask, {})
+                cards, weights = zip(*choices)
+                card = rng.choices(cards, weights)[0]
+                if card is not None:
+                    hands[player].discard(card)
+                state = state.after_play(player, card)
+    assert checked >= 8 and rejected_seen >= 1
 
 
 def deal_consistent_hands(rng, hero, hero_hand, deck):

@@ -16,7 +16,11 @@ usage: endgame_br.py GAMES WORKERS OUT.csv [--max-hidden 12] [--max-layouts 2000
          [--node-budget 1500000]
          [--opponents random,greedy,heuristic] [--driver heuristic]
          [--policies heuristic,seven_pair_rule,exact_vote,posterior_vote]
-         [--seed 0] [--resume]
+         [--seed 0] [--resume] [--skip-br --only-games-from EARLIER.csv]
+
+--only-games-from keeps the games an earlier run solved (same seed and table give
+the same endgames); with --skip-br the best response is not recomputed, so the
+rows are joined with the earlier run's for regret.
 """
 import argparse, csv, os, random, sys, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -62,7 +66,7 @@ def play_to_endgame(rng, deck, driver, opponents, max_hidden):
 
 
 def solve_game(job):
-    index, seed, max_hidden, max_layouts, node_budget, opponent_names, driver_name, policy_names = job
+    index, seed, max_hidden, max_layouts, node_budget, opponent_names, driver_name, policy_names, skip_br = job
     deck = frozenset(full_deck())
     rng = random.Random(seed * 1_000_003 + index)
     opponents = {seat: opponent_policy(name, deck) for seat, name in zip((1, 2, 3), opponent_names)}
@@ -97,8 +101,9 @@ def solve_game(job):
     solver.node_budget = node_budget
     started = time.perf_counter()
     try:
-        row["best_response"] = solver.value()
-        row["br_seconds"] = round(time.perf_counter() - started, 2)
+        if not skip_br:
+            row["best_response"] = solver.value()
+            row["br_seconds"] = round(time.perf_counter() - started, 2)
         for name in policy_names:
             started = time.perf_counter()
             row[name] = solver.value(hero_policy(name, deck))
@@ -115,7 +120,7 @@ def solve_game(job):
 
 def summarise(rows, policy_names, games):
     statuses = Counter(row["status"] for row in rows)
-    rows = [row for row in rows if row["status"] == "solved"]
+    rows = [row for row in rows if row["status"] == "solved" and row.get("best_response") not in (None, "")]
     print(f"\n{len(rows)} endgames solved from {games} games; {statuses['no_endgame']} had someone out first, "
           f"{statuses['too_large']} too large to solve; +/- is 1 SE over solved endgames")
     if not rows:
@@ -143,12 +148,19 @@ def main():
     parser.add_argument("--policies", default="heuristic,seven_pair_rule,exact_vote,posterior_vote")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--skip-br", action="store_true")
+    parser.add_argument("--only-games-from")
     args = parser.parse_args()
     opponent_names = tuple(args.opponents.split(","))
     policy_names = tuple(args.policies.split(","))
     assert len(opponent_names) == 3
 
-    jobs = [(i, args.seed, args.max_hidden, args.max_layouts, args.node_budget, opponent_names, args.driver, policy_names) for i in range(args.games)]
+    jobs = [(i, args.seed, args.max_hidden, args.max_layouts, args.node_budget, opponent_names, args.driver, policy_names, args.skip_br)
+            for i in range(args.games)]
+    if args.only_games_from:
+        with open(args.only_games_from, newline="") as handle:
+            keep = {int(row["game"]) for row in csv.DictReader(handle) if row["status"] == "solved"}
+        jobs = [job for job in jobs if job[0] in keep]
     rows = []
     if args.resume and os.path.exists(args.out):
         with open(args.out, newline="") as handle:
