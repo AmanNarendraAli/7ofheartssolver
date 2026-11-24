@@ -22,7 +22,7 @@ usage: endgame_br.py GAMES WORKERS OUT.csv [--max-hidden 12] [--max-layouts 2000
 the same endgames); with --skip-br the best response is not recomputed, so the
 rows are joined with the earlier run's for regret.
 """
-import argparse, csv, os, random, sys, time
+import argparse, csv, os, random, sys, time, traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import Counter
 from math import factorial, sqrt
@@ -175,12 +175,20 @@ def main():
     fields += [f for name in policy_names for f in (name, f"{name}_seconds")] + ["opponent_queries"]
     started = time.perf_counter()
     finished = 0
+    failed = []
     with open(args.out, "a" if rows else "w", newline="") as handle, ProcessPoolExecutor(args.workers) as pool:
         writer = csv.DictWriter(handle, fieldnames=fields)
         if not rows:
             writer.writeheader()
-        for future in as_completed([pool.submit(solve_game, job) for job in jobs]):
-            row = future.result()
+        futures = {pool.submit(solve_game, job): job[0] for job in jobs}
+        for future in as_completed(futures):
+            try:
+                row = future.result()
+            except Exception as error:  # keep the other games; the failed one is retried by --resume
+                failed.append(futures[future])
+                traceback.print_exception(error)
+                print(f"game {futures[future]} FAILED: {error!r}", flush=True)
+                continue
             rows.append(row)
             writer.writerow(row)
             handle.flush()
@@ -189,6 +197,8 @@ def main():
                 print(f"[{finished}/{len(jobs)}] {time.perf_counter() - started:.0f}s", flush=True)
     summarise(rows, policy_names, args.games)
     print(f"done in {time.perf_counter() - started:.0f}s -> {args.out}")
+    if failed:
+        sys.exit(f"{len(failed)} games failed: {sorted(failed)}")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import random
 import zlib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from itertools import combinations
 from math import comb
 from typing import Callable, Iterable, Mapping, NamedTuple
@@ -46,6 +46,7 @@ from seven_hearts import (
     SEVEN_GAP_POLICY,
     SEVEN_RULE_POLICY,
     SEVEN_PAIR_RULE_POLICY,
+    StrategyWeights,
 )
 
 Layout = tuple[int, int, int, int]  # opponents' hand masks by seat; the hero's slot is 0
@@ -67,7 +68,12 @@ OPPONENT_AGENTS = {
     "seven_gap": FullGameAgent("Seven Gap", SEVEN_GAP_POLICY),
     "seven_rule": FullGameAgent("Seven Rule", SEVEN_RULE_POLICY),
     "seven_pair_rule": FullGameAgent("Seven Pair Rule", SEVEN_PAIR_RULE_POLICY),
+    # The heuristic with defensive weights: values its own unlocks less and fears opening
+    # for opponents more. A held-out "sensible" opponent for testing table readers.
+    "cautious": FullGameAgent("Cautious", "heuristic", weights=StrategyWeights(
+        self_unlock=1.5, opponent_unlock_risk=4.0, response_penalty=0.7)),
 }
+NOISY_HEURISTIC_RANDOM_SHARE = 0.25  # noisy_heuristic plays uniformly at random this often
 
 
 def opponent_policy(name: str, deck: Iterable[Card]) -> OpponentPolicy:
@@ -81,6 +87,17 @@ def opponent_policy(name: str, deck: Iterable[Card]) -> OpponentPolicy:
             return tuple((card, 1.0 / len(legal)) for card in legal)
         uniform.cheap = True  # type: ignore[attr-defined]
         return uniform
+    if name == "noisy_heuristic":
+        heuristic = opponent_policy("heuristic", deck)
+        share = NOISY_HEURISTIC_RANDOM_SHARE
+
+        def noisy(state: GameState, player: int, hand_mask: int) -> Distribution:
+            legal = mask_to_cards(hand_mask & state.public_legal_mask())
+            if not legal:
+                return ((None, 1.0),)
+            (chosen, _), = heuristic(state, player, hand_mask)
+            return tuple((card, share / len(legal) + (1.0 - share) * (card == chosen)) for card in legal)
+        return noisy
     if name not in OPPONENT_AGENTS:
         raise ValueError(f"unknown opponent policy: {name}")
     agent = OPPONENT_AGENTS[name]
@@ -109,6 +126,8 @@ def hero_policy(name: str, deck: Iterable[Card]) -> HeroPolicy:
     mc: Monte Carlo over every consistent layout with heuristic rollouts.
     reader:<agent>: assumes every opponent plays <agent> (e.g. reader:heuristic) and votes
         over the hands that explain their moves; see ModelBelief.
+    mix:<a>+<b>+...[@tremble]: treats each opponent as one of the listed agents (equal prior),
+        each of which sometimes plays at random; votes over the joint posterior. See MixtureBelief.
     """
     deck = frozenset(deck)
     if name in ("random", *OPPONENT_AGENTS):
@@ -133,6 +152,9 @@ def hero_policy(name: str, deck: Iterable[Card]) -> HeroPolicy:
         return posterior_vote(deck)
     if name.startswith("reader:"):
         return model_reader(deck, name.split(":")[1])
+    if name.startswith("mix:"):
+        spec, _, tremble = name[4:].partition("@")
+        return mixture_reader(deck, spec.split("+"), float(tremble) if tremble else DEFAULT_TREMBLE)
     raise ValueError(f"unknown hero policy: {name}")
 
 
@@ -638,13 +660,14 @@ class ModelBelief:
             if event.card is None and event.player in self.possible:
                 self.possible[event.player] &= ~before.public_legal_mask()
         # seat -> hands that explain the seat's moves, or None once the model is rejected for it
-        self.explained: dict[int, set[int] | None] = {}
+        # (dicts used as ordered sets, so sampling draws the same hands however the belief was reached)
+        self.explained: dict[int, dict[int, None] | None] = {}
         for seat in self.seats:
-            hands = set()
+            hands = {}
             for hand in combinations(mask_to_cards(self.possible[seat]), state.hand_counts[seat]):  # type: ignore[arg-type]
                 mask = card_set_mask(hand)
                 if history_likelihood(model, states, state.history, seat, mask) > 0.0:
-                    hands.add(mask)
+                    hands[mask] = None
             self.explained[seat] = hands or None
 
     def advanced(self, state: GameState) -> "ModelBelief":
@@ -667,14 +690,14 @@ class ModelBelief:
                     else:
                         new.possible[seat] &= ~bit
                     if hands is not None:
-                        kept = {mask & ~bit for mask in hands
+                        kept = {mask & ~bit: None for mask in hands
                                 if (event.card is None or mask & bit)
                                 and dict(new.model(current, seat, mask)).get(event.card, 0.0) > 0.0}
                         new.explained[seat] = kept or None
                 elif bit:
                     new.possible[seat] &= ~bit
                     if hands is not None:
-                        kept = {mask for mask in hands if not mask & bit}
+                        kept = {mask: None for mask in hands if not mask & bit}
                         new.explained[seat] = kept or None
             current = current.after_play(mover, event.card)
         new.state = state
@@ -779,34 +802,269 @@ def model_reader(deck: frozenset[Card], model_name: str, max_layouts: int = 512)
     earlier decision rather than rebuilt. Ties go to the heuristic's preferred move.
     """
     model = opponent_policy(model_name, deck)
-    cache: dict[tuple, ModelBelief] = {}
+    beliefs = BeliefCache(
+        lambda state, player, hand_mask: ModelBelief(state, player, hand_mask, model, deck), 10_000, len(deck))
 
     def vote(state: GameState, player: int, hand_mask: int, belief: Belief) -> Distribution:
         legal = list(mask_to_cards(hand_mask & state.public_legal_mask()))
         if len(legal) == 1:
             return ((legal[0], 1.0),)
+        layouts = beliefs.get(state, player, hand_mask).layouts(hand_mask, max_layouts, info_state_rng(state, hand_mask))
+        return ((weighted_vote(state, player, hand_mask, legal, [(layout, 1) for layout in layouts], deck), 1.0),)
+    return vote
+
+
+class BeliefCache:
+    """A reader's beliefs by history, each advanced from the nearest earlier one.
+
+    Building from scratch reads the whole game's history and is the slow part, so
+    those beliefs are kept for good, and a history with no cached ancestor is built
+    where it branches off from one already built (with the hand held there), so later
+    branches can share it. Advancing caches the belief after every event, so a
+    branch is advanced only from where it leaves the others; those beliefs are
+    dropped when there are `limit`.
+    """
+
+    def __init__(
+        self, build: Callable[[GameState, int, int], "ModelBelief | MixtureBelief"], limit: int, deck_size: int
+    ):
+        self.build = build
+        self.limit = limit
+        self.deck_size = deck_size
+        self.built: dict[tuple, ModelBelief | MixtureBelief] = {}
+        self.advanced: dict[tuple, ModelBelief | MixtureBelief] = {}
+
+    def get(self, state: GameState, player: int, hand_mask: int) -> "ModelBelief | MixtureBelief":
         history = state.history
-        known = None
         for length in range(len(history), -1, -1):
-            known = cache.get((player, history[:length]))
+            key = (player, history[:length])
+            known = self.advanced.get(key) or self.built.get(key)
             if known is not None:
                 break
-        current = known.advanced(state) if known is not None else ModelBelief(state, player, hand_mask, model, deck)
-        if len(cache) >= 20_000:
-            cache.clear()
-        cache[(player, history)] = current
-        key = ",".join(f"{event.player}{event.card}" for event in history) + f"|{hand_mask}"
-        layouts = current.layouts(hand_mask, max_layouts, random.Random(zlib.crc32(key.encode())))
-        hero_cards = mask_to_cards(hand_mask)
-        wins = [0] * len(legal)
-        for layout in layouts:
-            hands = {seat: mask_to_cards(mask) for seat, mask in enumerate(layout)}
-            hands[player] = hero_cards
-            for index, won in enumerate(FirstOutSolver(hands).move_wins(state.table, player, legal)):
-                wins[index] += won
-        knowledge = PlayerKnowledge(player, frozenset(hero_cards), deck=deck)
-        model_scores = build_opponent_model(state, knowledge)
-        heuristic = [score_move(state, knowledge, card, model=model_scores, weights=DEFAULT_WEIGHTS).score for card in legal]
-        best = max(range(len(legal)), key=lambda index: (wins[index], heuristic[index]))
-        return ((legal[best], 1.0),)
+        else:
+            known = self._build_at_branch(state, player, hand_mask)
+        current = known
+        start = len(known.state.history)
+        if start < len(history):
+            states = replay_states(state, self.deck_size) if start + 1 < len(history) else []
+            for length in range(start + 1, len(history) + 1):
+                current = current.advanced(states[length] if length < len(history) else state)
+                if len(self.advanced) >= self.limit:
+                    self.advanced.clear()
+                self.advanced[(player, history[:length])] = current
+        return current
+
+    def _build_at_branch(self, state: GameState, player: int, hand_mask: int) -> "ModelBelief | MixtureBelief":
+        history = state.history
+        shared = 0
+        for built_player, built_history in self.built:
+            if built_player == player:
+                common = next((index for index, (a, b) in enumerate(zip(history, built_history)) if a != b),
+                              min(len(history), len(built_history)))
+                shared = max(shared, common)
+        if shared:  # rebuild at the branch point: the position after `shared` events
+            earlier = replay_states(state, self.deck_size)[shared] if shared < len(history) else state
+            for event in history[shared:]:
+                if event.player == player and event.card is not None:
+                    hand_mask |= card_bit(event.card)
+            state = earlier
+        belief = self.build(state, player, hand_mask)
+        self.built[(player, state.history)] = belief
+        return belief
+
+
+def info_state_rng(state: GameState, hand_mask: int) -> random.Random:
+    """A generator seeded by what the player knows, so sampling policies stay fixed functions of it."""
+    key = ",".join(f"{event.player}{event.card}" for event in state.history) + f"|{hand_mask}"
+    return random.Random(zlib.crc32(key.encode()))
+
+
+def weighted_vote(
+    state: GameState, player: int, hand_mask: int, legal: list[Card],
+    layouts: Iterable[tuple[Layout, float]], deck: frozenset[Card],
+) -> Card:
+    """The legal move that goes out first in the most layout weight; ties go to the heuristic."""
+    hero_cards = mask_to_cards(hand_mask)
+    wins = [0.0] * len(legal)
+    for layout, weight in layouts:
+        hands = {seat: mask_to_cards(mask) for seat, mask in enumerate(layout)}
+        hands[player] = hero_cards
+        for index, won in enumerate(FirstOutSolver(hands).move_wins(state.table, player, legal)):
+            if won:
+                wins[index] += weight
+    knowledge = PlayerKnowledge(player, frozenset(hero_cards), deck=deck)
+    model_scores = build_opponent_model(state, knowledge)
+    heuristic = [score_move(state, knowledge, card, model=model_scores, weights=DEFAULT_WEIGHTS).score for card in legal]
+    return legal[max(range(len(legal)), key=lambda index: (wins[index], heuristic[index]))]
+
+
+DEFAULT_TREMBLE = 0.1
+EXACT_JOIN_LIMIT = 20_000_000  # hand pairs scanned to weigh every layout exactly (~0.1 s); above this, importance sampling
+
+
+class MixtureBelief:
+    """What a player believes about the opponents' hands if each opponent is one of `models`.
+
+    Each opponent's type is unknown, independent of the others and equally likely to
+    be any of `models`; a player of a type plays the type's move, except that with
+    probability `tremble` they play a uniformly random legal card. So a seat's weight
+    for a hand is the average over types of the probability that the type, holding
+    that hand, made the seat's moves. Unlike ModelBelief, no hand is ruled out by a
+    model, only by the cards: what has been played and what forced passes show.
+
+    Built once from a position's full history, then advanced move by move.
+    """
+
+    def __init__(
+        self, state: GameState, player: int, hand_mask: int, models: list[OpponentPolicy], tremble: float,
+        deck: frozenset[Card],
+    ):
+        self.state = state
+        self.player = player
+        self.models = models
+        self.tremble = tremble
+        self.deck = deck
+        self.seats = [seat for seat in range(4) if seat != player]
+        states = replay_states(state, len(deck))
+        unseen = card_set_mask(deck) & ~hand_mask & ~state.played_cards_mask()
+        possible = {seat: unseen for seat in self.seats}
+        for before, event in zip(states, state.history):
+            if event.card is None and event.player in possible:
+                possible[event.player] &= ~before.public_legal_mask()
+        # seat -> {current hand mask: likelihood of the seat's moves under each type}
+        self.hands: dict[int, dict[int, tuple[float, ...]]] = {}
+        for seat in self.seats:
+            moves = [(index, event.card) for index, event in enumerate(state.history)
+                     if event.player == seat and event.card is not None]
+            scored = {}
+            for hand in combinations(mask_to_cards(possible[seat]), state.hand_counts[seat]):  # type: ignore[arg-type]
+                mask = card_set_mask(hand)
+                likelihoods = [1.0] * len(models)
+                held = mask
+                for index, card in reversed(moves):  # backwards, so the hand at each move is known
+                    held |= card_bit(card)
+                    self._update(likelihoods, states[index], seat, held, card)
+                scored[mask] = tuple(likelihoods)
+            self.hands[seat] = scored
+
+    def _update(self, likelihoods: list[float], state: GameState, seat: int, held: int, card: Card) -> None:
+        """Multiply in each type's probability of playing `card` from `held` at `state`."""
+        choices = (held & state.public_legal_mask()).bit_count()
+        if choices == 1:
+            return
+        for index, model in enumerate(self.models):
+            played = dict(model(state, seat, held)).get(card, 0.0)
+            likelihoods[index] *= (1.0 - self.tremble) * played + self.tremble / choices
+
+    def weights(self, seat: int) -> dict[int, float]:
+        return {mask: sum(likelihoods) / len(likelihoods) for mask, likelihoods in self.hands[seat].items()}
+
+    def advanced(self, state: GameState) -> "MixtureBelief":
+        """The belief at a later position whose history extends this one's."""
+        if state.history[: len(self.state.history)] != self.state.history:
+            raise ValueError("not a continuation of this position")
+        new = object.__new__(MixtureBelief)
+        new.__dict__.update(self.__dict__)
+        new.hands = dict(self.hands)
+        current = self.state
+        for event in state.history[len(self.state.history):]:
+            mover = event.player
+            if event.card is None:
+                if mover in new.hands:
+                    legal = current.public_legal_mask()
+                    new.hands[mover] = {mask: value for mask, value in new.hands[mover].items() if not mask & legal}
+            else:
+                bit = card_bit(event.card)
+                for seat in new.seats:
+                    if seat == mover:
+                        kept = {}
+                        for mask, value in new.hands[seat].items():
+                            if mask & bit:
+                                likelihoods = list(value)
+                                new._update(likelihoods, current, seat, mask, event.card)
+                                kept[mask & ~bit] = tuple(likelihoods)
+                    else:
+                        kept = {mask: value for mask, value in new.hands[seat].items() if not mask & bit}
+                    new.hands[seat] = kept
+            current = current.after_play(mover, event.card)
+        new.state = state
+        return new
+
+    def layouts(self, hand_mask: int, limit: int, rng: random.Random) -> list[tuple[Layout, float]]:
+        """Layouts with weights proportional to the posterior: all of them if at most `limit`
+        have weight, else `limit` drawn from the posterior (weight 1 each) or, when weighing
+        every layout is too slow, drawn by importance sampling (weights to match)."""
+        unseen = card_set_mask(self.deck) & ~hand_mask & ~self.state.played_cards_mask()
+        first, second, third = sorted(self.seats, key=lambda seat: len(self.hands[seat]))
+        weights_a, weights_b, weights_c = (self.weights(seat) for seat in (first, second, third))
+
+        def layout(mask_a: int, mask_b: int) -> Layout:
+            out = [0, 0, 0, 0]
+            out[first], out[second], out[third] = mask_a, mask_b, unseen & ~mask_a & ~mask_b
+            return tuple(out)  # type: ignore[return-value]
+
+        def completions(mask_a: int) -> tuple[list[int], list[float]]:
+            """The second seat's hands that fit with `mask_a`, each weighted with the third seat's rest."""
+            rest = unseen & ~mask_a
+            masks, weights = [], []
+            for mask_b, weight_b in weights_b.items():
+                if mask_b & ~rest == 0:
+                    weight_c = weights_c.get(rest & ~mask_b, 0.0)
+                    if weight_c > 0.0:
+                        masks.append(mask_b)
+                        weights.append(weight_b * weight_c)
+            return masks, weights
+
+        def draw(chosen_a: list[int], scale: Callable[[float], float]) -> list[tuple[Layout, float]]:
+            out = []
+            for mask_a, times in Counter(chosen_a).items():
+                masks, weights = completions(mask_a)
+                if not masks:  # nothing the others can hold: zero importance weight
+                    continue
+                total = sum(weights)
+                for mask_b in rng.choices(masks, weights, k=times):
+                    out.append((layout(mask_a, mask_b), scale(total)))
+            return out
+
+        if len(weights_a) * len(weights_b) > EXACT_JOIN_LIMIT:
+            # Importance sampling: the first seat's hand from its own weights, the rest exactly
+            # given it, so each draw is weighted by how well the other two seats can complete it.
+            sampled = draw(rng.choices(list(weights_a), list(weights_a.values()), k=limit), lambda total: total)
+            if sampled:
+                return sampled
+            # Otherwise no drawn hand could be completed: weigh every layout, however slow.
+        totals, count = {}, 0
+        for mask_a in weights_a:
+            masks, weights = completions(mask_a)
+            if weights:
+                totals[mask_a] = weights_a[mask_a] * sum(weights)
+                count += len(masks)
+        if count <= limit:
+            out = []
+            for mask_a in totals:
+                masks, weights = completions(mask_a)
+                out.extend((layout(mask_a, mask_b), weights_a[mask_a] * weight) for mask_b, weight in zip(masks, weights))
+            return out
+        chosen = rng.choices(list(totals), list(totals.values()), k=limit)
+        return draw(chosen, lambda total: 1.0)
+
+
+def mixture_reader(
+    deck: frozenset[Card], model_names: list[str], tremble: float = DEFAULT_TREMBLE, max_layouts: int = 512
+) -> HeroPolicy:
+    """Vote over the posterior of a MixtureBelief over `model_names`.
+
+    Uses only the hero's own information, never the real table's policies. Beliefs
+    are cached by history and advanced from the nearest earlier decision.
+    """
+    models = [opponent_policy(name, deck) for name in model_names]
+    beliefs = BeliefCache(
+        lambda state, player, hand_mask: MixtureBelief(state, player, hand_mask, models, tremble, deck), 2_000, len(deck))
+
+    def vote(state: GameState, player: int, hand_mask: int, belief: Belief) -> Distribution:
+        legal = list(mask_to_cards(hand_mask & state.public_legal_mask()))
+        if len(legal) == 1:
+            return ((legal[0], 1.0),)
+        layouts = beliefs.get(state, player, hand_mask).layouts(hand_mask, max_layouts, info_state_rng(state, hand_mask))
+        return ((weighted_vote(state, player, hand_mask, legal, layouts, deck), 1.0),)
     return vote

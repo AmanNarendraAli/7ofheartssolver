@@ -2361,7 +2361,7 @@ def test_best_response_from_position_matches_the_full_game_solver() -> None:
 def test_model_belief_matches_exact_posterior_and_advances_consistently() -> None:
     """Against a table that really plays the model, the belief is the exact posterior's support."""
     from best_response import ModelBelief
-    checked = rejected_seen = 0
+    checked = rejected_seen = sampled = 0
     for cards_per_suit, count, seed, names in ((3, 3, 41, ("heuristic",) * 3), (3, 3, 42, ("random", "greedy", "heuristic"))):
         rng = random.Random(seed)
         for deck, hero, hero_hand, _ in best_response_cases(cards_per_suit, count, seed):
@@ -2381,6 +2381,9 @@ def test_model_belief_matches_exact_posterior_and_advances_consistently() -> Non
                     assert belief.explained == fresh.explained and belief.possible == fresh.possible
                     layouts = belief.layouts(mask, 10**6, random.Random(0))
                     assert len(set(layouts)) == len(layouts)
+                    # sampling draws the same layouts whichever way the belief was reached
+                    assert belief.layouts(mask, 3, random.Random(1)) == fresh.layouts(mask, 3, random.Random(1))
+                    sampled += len(layouts) > 3
                     for layout in layouts:
                         assert sum(layout) == card_set_mask(deck) & ~mask & ~state.played_cards_mask()
                         assert all(layout[seat].bit_count() == state.hand_counts[seat] for seat in seats)
@@ -2398,7 +2401,130 @@ def test_model_belief_matches_exact_posterior_and_advances_consistently() -> Non
                 if card is not None:
                     hands[player].discard(card)
                 state = state.after_play(player, card)
-    assert checked >= 8 and rejected_seen >= 1
+    assert checked >= 8 and rejected_seen >= 1 and sampled >= 2
+
+
+def test_mixture_belief_is_the_posterior_of_trembling_types() -> None:
+    """With one type the belief is the exact posterior against that trembling policy; with
+    several, each seat's weight is the type-average likelihood; advancing equals rebuilding,
+    down to the layouts sampled from it."""
+    import best_response
+    from best_response import MixtureBelief, history_likelihood, replay_states
+
+    def trembling(policy, tremble):
+        def play(state, player, hand_mask):
+            legal = mask_to_cards(hand_mask & state.public_legal_mask())
+            if not legal:
+                return ((None, 1.0),)
+            chosen = dict(policy(state, player, hand_mask))
+            return tuple((card, (1 - tremble) * chosen.get(card, 0.0) + tremble / len(legal)) for card in legal)
+        return play
+
+    checked = sampled = 0
+    for seed, names, model_names in ((51, ("heuristic", "greedy", "random"), ("heuristic",)),
+                                     (52, ("random", "greedy", "heuristic"), ("heuristic", "greedy", "random"))):
+        rng = random.Random(seed)
+        for deck, hero, hero_hand, _ in best_response_cases(3, 2, seed):
+            seats = [seat for seat in range(4) if seat != hero]
+            table = {seat: opponent_policy(name, deck) for seat, name in zip(seats, names)}
+            models = [opponent_policy(name, deck) for name in model_names]
+            hands = {seat: set(cards) for seat, cards in enumerate(deal_consistent_hands(rng, hero, hero_hand, deck))}
+            starter = next(seat for seat in range(4) if Card(Suit.HEARTS, 7) in hands[seat])
+            state = GameState(hand_counts=(3,) * 4, current_player=starter)
+            belief = None
+            while all(hands.values()):
+                player = state.current_player
+                mask = card_set_mask(hands[player])
+                if player == hero and state.history:
+                    fresh = MixtureBelief(state, hero, mask, models, 0.2, deck)
+                    belief = fresh if belief is None else belief.advanced(state)
+                    for seat in seats:
+                        assert set(belief.hands[seat]) == set(fresh.hands[seat])
+                        assert all(abs(a - b) < 1e-12 for hand in fresh.hands[seat]
+                                   for a, b in zip(belief.hands[seat][hand], fresh.hands[seat][hand]))
+                    states = replay_states(state, len(deck))
+                    for seat in seats:
+                        for hand, weight in belief.weights(seat).items():
+                            expected = sum(history_likelihood(trembling(model, 0.2), states, state.history, seat, hand)
+                                           for model in models) / len(models)
+                            assert abs(weight - expected) < 1e-12
+                    layouts = belief.layouts(mask, 10**6, random.Random(0))
+                    true_layout = tuple(card_set_mask(hands[seat]) if seat != hero else 0 for seat in range(4))
+                    assert true_layout in dict(layouts)
+                    if len(models) == 1:
+                        posterior = position_posterior(state, hero, mask, {seat: trembling(models[0], 0.2) for seat in seats}, deck)
+                        assert set(dict(layouts)) == set(posterior)
+                        scale = sum(posterior.values()) / sum(weight for _, weight in layouts)
+                        assert all(abs(weight * scale - posterior[layout]) < 1e-9 for layout, weight in layouts)
+                    support = dict(layouts)
+                    exact_limit = best_response.EXACT_JOIN_LIMIT
+                    for join_limit in (exact_limit, 0):  # drawn from the posterior, then importance sampled
+                        best_response.EXACT_JOIN_LIMIT = join_limit
+                        try:
+                            drawn = belief.layouts(mask, 3, random.Random(1))
+                            redrawn = fresh.layouts(mask, 3, random.Random(1))
+                        finally:
+                            best_response.EXACT_JOIN_LIMIT = exact_limit
+                        assert [layout for layout, _ in drawn] == [layout for layout, _ in redrawn]
+                        assert len(drawn) == 3 and all(layout in support and weight > 0 for layout, weight in drawn)
+                        sampled += len(support) > 3
+                    # A hand the others cannot complete has zero weight, even if it is all that gets drawn.
+                    impossible = object.__new__(MixtureBelief)
+                    impossible.__dict__.update(belief.__dict__)
+                    first = min(seats, key=lambda seat: len(belief.hands[seat]))
+                    good = next(iter(support))[first]
+                    best_response.EXACT_JOIN_LIMIT = 0
+                    try:
+                        for bad_weight, draws in ((1.0, 50), (1e12, 3)):  # some draws survive; (almost surely) none do
+                            impossible.hands = {**belief.hands, first: {
+                                mask: (bad_weight,) * len(models), good: belief.hands[first][good]}}
+                            impossible.seats = [first] + [seat for seat in seats if seat != first]
+                            drawn = impossible.layouts(mask, draws, random.Random(1))
+                            assert drawn and all(layout in support and layout[first] == good for layout, _ in drawn)
+                    finally:
+                        best_response.EXACT_JOIN_LIMIT = exact_limit
+                    checked += 1
+                choices = table[player](state, player, mask) if player != hero else \
+                    hero_policy("heuristic", deck)(state, player, mask, {})
+                cards, weights = zip(*choices)
+                card = rng.choices(cards, weights)[0]
+                if card is not None:
+                    hands[player].discard(card)
+                state = state.after_play(player, card)
+    assert checked >= 4 and sampled >= 2
+
+
+def test_reader_belief_cache_plays_like_rebuilding_every_belief() -> None:
+    import best_response
+    from best_response import BeliefCache
+
+    def uncached(self, state, player, hand_mask):
+        return self.build(state, player, hand_mask)
+
+    branch_builds = 0
+    for deck, hero, hero_hand, opponents in best_response_cases(3, 3, 61):
+        solver = BestResponseSolver(hero_hand, opponents, hero=hero, deck=deck)
+        for name in ("reader:heuristic", "mix:heuristic+greedy+random"):
+            build = BeliefCache._build_at_branch
+
+            def counting(self, state, *args):
+                nonlocal branch_builds
+                belief = build(self, state, *args)
+                branch_builds += len(belief.state.history) < len(state.history)  # built at an earlier branch point
+                return belief
+            BeliefCache._build_at_branch = counting
+            try:
+                cached = solver.value(hero_policy(name, deck))
+            finally:
+                BeliefCache._build_at_branch = build
+            original = BeliefCache.get
+            BeliefCache.get = uncached
+            try:
+                fresh = solver.value(hero_policy(name, deck))
+            finally:
+                BeliefCache.get = original
+            assert abs(cached - fresh) < 1e-12
+    assert branch_builds >= 1
 
 
 def deal_consistent_hands(rng, hero, hero_hand, deck):
