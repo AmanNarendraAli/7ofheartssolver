@@ -74,11 +74,71 @@ OPPONENT_AGENTS = {
         self_unlock=1.5, opponent_unlock_risk=4.0, response_penalty=0.7)),
 }
 NOISY_HEURISTIC_RANDOM_SHARE = 0.25  # noisy_heuristic plays uniformly at random this often
+LATE_SEARCH_MAX_HAND = 5  # late_search searches from this many cards down
+LATE_SEARCH_LAYOUTS = 8
+
+
+def suit_ranks(hand_mask: int, card: Card) -> set[int]:
+    return {held.rank for held in mask_to_cards(hand_mask) if held.suit == card.suit}
+
+
+def cards_released(hand_mask: int, card: Card) -> int:
+    """How many cards not in this hand become playable when `card` is played."""
+    if card.rank == 7:
+        opened = {6, 8}
+    else:
+        opened = {card.rank + (1 if card.rank > 7 else -1)} & set(range(1, 14))
+    return len(opened - suit_ranks(hand_mask, card))
+
+
+def own_cards_behind(hand_mask: int, card: Card) -> int:
+    """How many of this hand's cards lie further out than `card` on its side of the suit."""
+    ranks = suit_ranks(hand_mask, card)
+    if card.rank == 7:
+        return len(ranks) - 1
+    return sum(rank > card.rank if card.rank > 7 else rank < card.rank for rank in ranks)
+
+
+# One-rule players written without the heuristic's scoring: the legal card with the lowest
+# key, ties to the first in card order. In full games blocker is about as strong as the
+# heuristic and blocker_long in between; the other three are about as weak as random but
+# play unlike heuristic and greedy.
+RULE_KEYS: dict[str, Callable[[int, Card], tuple]] = {
+    "opener": lambda hand, card: (abs(card.rank - 7),),  # greedy's opposite
+    "long_suit": lambda hand, card: (-len(suit_ranks(hand, card)), abs(card.rank - 7)),
+    "short_suit": lambda hand, card: (len(suit_ranks(hand, card)), abs(card.rank - 7)),
+    "blocker": lambda hand, card: (cards_released(hand, card), -own_cards_behind(hand, card), -abs(card.rank - 7)),
+    "blocker_long": lambda hand, card: (cards_released(hand, card), -len(suit_ranks(hand, card)), abs(card.rank - 7)),
+}
 
 
 def opponent_policy(name: str, deck: Iterable[Card]) -> OpponentPolicy:
-    """The evaluation's fixed agents as action distributions: random, greedy, heuristic."""
+    """Fixed opponents as action distributions over what they know.
+
+    random, the agents in OPPONENT_AGENTS, noisy_heuristic; the rule players in RULE_KEYS;
+    and late_search (blocker until LATE_SEARCH_MAX_HAND cards, then Exact Vote over
+    LATE_SEARCH_LAYOUTS layouts).
+    """
     deck = frozenset(deck)
+    if name in RULE_KEYS:
+        rule = RULE_KEYS[name]
+
+        def by_rule(state: GameState, player: int, hand_mask: int) -> Distribution:
+            legal = mask_to_cards(hand_mask & state.public_legal_mask())
+            if not legal:
+                return ((None, 1.0),)
+            return ((min(legal, key=lambda card: rule(hand_mask, card)), 1.0),)  # min keeps the first: card order
+        by_rule.cheap = True  # type: ignore[attr-defined]
+        return by_rule
+    if name == "late_search":
+        early = opponent_policy("blocker", deck)
+        search = sampled_exact_vote(deck, LATE_SEARCH_LAYOUTS)
+
+        def late(state: GameState, player: int, hand_mask: int) -> Distribution:
+            if hand_mask.bit_count() > LATE_SEARCH_MAX_HAND or (hand_mask & state.public_legal_mask()).bit_count() < 2:
+                return early(state, player, hand_mask)
+            return search(state, player, hand_mask, {})
+        return late
     if name == "random":
         def uniform(state: GameState, player: int, hand_mask: int) -> Distribution:
             legal = mask_to_cards(hand_mask & state.public_legal_mask())
