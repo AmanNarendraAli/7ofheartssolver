@@ -111,12 +111,45 @@ RULE_KEYS: dict[str, Callable[[int, Card], tuple]] = {
     "blocker_long": lambda hand, card: (cards_released(hand, card), -len(suit_ranks(hand, card)), abs(card.rank - 7)),
 }
 
+SUIT_ORDER = {suit: index for index, suit in enumerate(Suit)}
+
+
+def off_last_suit(state: GameState, card: Card) -> bool:
+    """Whether `card` is not of the suit of the last card anyone played."""
+    last = next((event.card for event in reversed(state.history) if event.card is not None), None)
+    return last is not None and card.suit != last.suit
+
+
+# One-rule players that use the public history or absolute ranks and suits, none of which
+# the wide reader's types (FEATURE_TYPES) look at; same conventions as RULE_KEYS.
+STATE_RULE_KEYS: dict[str, Callable[[GameState, int, Card], tuple]] = {
+    "follow": lambda state, hand, card: (off_last_suit(state, card), -card.rank),
+    "high_first": lambda state, hand, card: (-card.rank, SUIT_ORDER[card.suit]),
+    "suit_order": lambda state, hand, card: (SUIT_ORDER[card.suit], card.rank),
+    "blocker_high": lambda state, hand, card: (cards_released(hand, card), -card.rank),
+    "blocker_follow": lambda state, hand, card: (cards_released(hand, card), off_last_suit(state, card), card.rank),
+}
+
+# A wide, generic set of types for MixtureBelief: the card with the most of one feature,
+# uniform over ties. "mix:wide" is the heuristic, random and these eight.
+FEATURE_TYPES: dict[str, Callable[[int, Card], int]] = {
+    "far": lambda hand, card: abs(card.rank - 7),
+    "near": lambda hand, card: -abs(card.rank - 7),
+    "long": lambda hand, card: len(suit_ranks(hand, card)),
+    "short": lambda hand, card: -len(suit_ranks(hand, card)),
+    "release_few": lambda hand, card: -cards_released(hand, card),
+    "release_many": lambda hand, card: cards_released(hand, card),
+    "behind_many": lambda hand, card: own_cards_behind(hand, card),
+    "behind_few": lambda hand, card: -own_cards_behind(hand, card),
+}
+WIDE_TYPES = ("heuristic", "random", *FEATURE_TYPES)
+
 
 def opponent_policy(name: str, deck: Iterable[Card]) -> OpponentPolicy:
     """Fixed opponents as action distributions over what they know.
 
-    random, the agents in OPPONENT_AGENTS, noisy_heuristic; the rule players in RULE_KEYS;
-    and late_search (blocker until LATE_SEARCH_MAX_HAND cards, then Exact Vote over
+    random, the agents in OPPONENT_AGENTS, noisy_heuristic; the rule players in RULE_KEYS
+    and STATE_RULE_KEYS; the single-feature FEATURE_TYPES; and late_search (blocker until LATE_SEARCH_MAX_HAND cards, then Exact Vote over
     LATE_SEARCH_LAYOUTS layouts).
     """
     deck = frozenset(deck)
@@ -130,6 +163,29 @@ def opponent_policy(name: str, deck: Iterable[Card]) -> OpponentPolicy:
             return ((min(legal, key=lambda card: rule(hand_mask, card)), 1.0),)  # min keeps the first: card order
         by_rule.cheap = True  # type: ignore[attr-defined]
         return by_rule
+    if name in STATE_RULE_KEYS:
+        state_rule = STATE_RULE_KEYS[name]
+
+        def by_state_rule(state: GameState, player: int, hand_mask: int) -> Distribution:
+            legal = mask_to_cards(hand_mask & state.public_legal_mask())
+            if not legal:
+                return ((None, 1.0),)
+            return ((min(legal, key=lambda card: state_rule(state, hand_mask, card)), 1.0),)
+        by_state_rule.cheap = True  # type: ignore[attr-defined]
+        return by_state_rule
+    if name in FEATURE_TYPES:
+        feature = FEATURE_TYPES[name]
+
+        def by_feature(state: GameState, player: int, hand_mask: int) -> Distribution:
+            legal = mask_to_cards(hand_mask & state.public_legal_mask())
+            if not legal:
+                return ((None, 1.0),)
+            values = [feature(hand_mask, card) for card in legal]
+            top = max(values)
+            best = [card for card, value in zip(legal, values) if value == top]
+            return tuple((card, 1.0 / len(best)) for card in best)
+        by_feature.cheap = True  # type: ignore[attr-defined]
+        return by_feature
     if name == "late_search":
         early = opponent_policy("blocker", deck)
         search = sampled_exact_vote(deck, LATE_SEARCH_LAYOUTS)
@@ -188,6 +244,7 @@ def hero_policy(name: str, deck: Iterable[Card]) -> HeroPolicy:
         over the hands that explain their moves; see ModelBelief.
     mix:<a>+<b>+...[@tremble]: treats each opponent as one of the listed agents (equal prior),
         each of which sometimes plays at random; votes over the joint posterior. See MixtureBelief.
+        mix:wide lists WIDE_TYPES.
     """
     deck = frozenset(deck)
     if name in ("random", *OPPONENT_AGENTS):
@@ -214,7 +271,8 @@ def hero_policy(name: str, deck: Iterable[Card]) -> HeroPolicy:
         return model_reader(deck, name.split(":")[1])
     if name.startswith("mix:"):
         spec, _, tremble = name[4:].partition("@")
-        return mixture_reader(deck, spec.split("+"), float(tremble) if tremble else DEFAULT_TREMBLE)
+        names = WIDE_TYPES if spec == "wide" else spec.split("+")
+        return mixture_reader(deck, list(names), float(tremble) if tremble else DEFAULT_TREMBLE)
     raise ValueError(f"unknown hero policy: {name}")
 
 
@@ -1118,8 +1176,9 @@ def mixture_reader(
     are cached by history and advanced from the nearest earlier decision.
     """
     models = [opponent_policy(name, deck) for name in model_names]
+    limit = min(2_000, 6_000 // len(models))  # each belief stores a likelihood per type
     beliefs = BeliefCache(
-        lambda state, player, hand_mask: MixtureBelief(state, player, hand_mask, models, tremble, deck), 2_000, len(deck))
+        lambda state, player, hand_mask: MixtureBelief(state, player, hand_mask, models, tremble, deck), limit, len(deck))
 
     def vote(state: GameState, player: int, hand_mask: int, belief: Belief) -> Distribution:
         legal = list(mask_to_cards(hand_mask & state.public_legal_mask()))

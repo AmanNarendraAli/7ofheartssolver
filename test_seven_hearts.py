@@ -2422,7 +2422,8 @@ def test_mixture_belief_is_the_posterior_of_trembling_types() -> None:
 
     checked = sampled = 0
     for seed, names, model_names in ((51, ("heuristic", "greedy", "random"), ("heuristic",)),
-                                     (52, ("random", "greedy", "heuristic"), ("heuristic", "greedy", "random"))):
+                                     (52, ("random", "greedy", "heuristic"), ("heuristic", "greedy", "random")),
+                                     (53, ("opener", "greedy", "heuristic"), ("heuristic", "random", "near", "release_few"))):
         rng = random.Random(seed)
         for deck, hero, hero_hand, _ in best_response_cases(3, 2, seed):
             seats = [seat for seat in range(4) if seat != hero]
@@ -2536,7 +2537,8 @@ def deal_consistent_hands(rng, hero, hero_hand, deck):
 
 
 def test_rule_and_search_opponents_play_by_their_rules() -> None:
-    from best_response import LATE_SEARCH_MAX_HAND, RULE_KEYS, cards_released, own_cards_behind
+    from best_response import (FEATURE_TYPES, LATE_SEARCH_MAX_HAND, RULE_KEYS, STATE_RULE_KEYS, cards_released,
+                               off_last_suit, own_cards_behind)
 
     def C(rank, suit=Suit.CLUBS):
         return Card(suit, rank)
@@ -2548,7 +2550,7 @@ def test_rule_and_search_opponents_play_by_their_rules() -> None:
     assert own_cards_behind(hand, C(3)) == 0 and cards_released(hand, C(5, Suit.SPADES)) == 1
 
     deck = frozenset(full_deck())
-    names = (*RULE_KEYS, "late_search")
+    names = (*RULE_KEYS, *STATE_RULE_KEYS, "late_search")
     policies = {name: opponent_policy(name, deck) for name in names}
     rng = random.Random(81)
     searched = 0
@@ -2566,12 +2568,25 @@ def test_rule_and_search_opponents_play_by_their_rules() -> None:
                 (card, probability), = policy(state, player, mask)
                 assert probability == 1.0 and (card in legal if legal else card is None)
                 assert policy(state, player, mask) == ((card, 1.0),)  # a fixed function of what the player knows
+                if name in STATE_RULE_KEYS and legal:
+                    key = STATE_RULE_KEYS[name]
+                    assert key(state, mask, card) == min(key(state, mask, option) for option in legal)
                 if name in RULE_KEYS and legal:
                     assert RULE_KEYS[name](mask, card) == min(RULE_KEYS[name](mask, option) for option in legal)
             if mask.bit_count() <= LATE_SEARCH_MAX_HAND:
                 searched += len(legal) > 1
             else:
                 assert policies["late_search"](state, player, mask) == policies["blocker"](state, player, mask)
+            for name, feature in FEATURE_TYPES.items():
+                chosen = dict(opponent_policy(name, deck)(state, player, mask))
+                assert abs(sum(chosen.values()) - 1.0) < 1e-12
+                if legal:
+                    top = max(feature(mask, option) for option in legal)
+                    assert set(chosen) == {option for option in legal if feature(mask, option) == top}
+                else:
+                    assert chosen == {None: 1.0}
+            last = next((event.card for event in reversed(state.history) if event.card is not None), None)
+            assert all(off_last_suit(state, option) == (last is not None and option.suit != last.suit) for option in legal)
             move = rng.choice(legal) if legal else None
             if move is not None:
                 hands[player].discard(move)
